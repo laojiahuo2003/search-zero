@@ -67,13 +67,20 @@ train = [
 # ("operator torchvision::nms does not exist"). The only contract with it is the
 # YAML schema in configs/sft_lora.yaml; this repo never imports it.
 
+# SwanLab experiment tracking. Guarded at runtime by app/utils/tracking.py, so
+# training scripts work with or without it. The [dashboard] extra is only needed
+# to view local-mode runs in a browser (`swanlab watch swanlog`).
+tracking = [
+    "swanlab>=0.9.0",
+]
+
 dev = [
     "pytest>=8.0.0",
 ]
 
 # Convenience: everything.
 all = [
-    "search-zero[retrieval,server,demo,wiki,train,dev]",
+    "search-zero[retrieval,server,demo,wiki,train,tracking,dev]",
 ]
 
 [tool.uv]

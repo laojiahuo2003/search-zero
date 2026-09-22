@@ -14,6 +14,7 @@ Usage (on A100):
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -31,6 +32,10 @@ from peft import PeftModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wiki_search import CachedWikiSearcher, LocalWikiSearcher
+
+# SwanLab tracking (optional — degrades to a no-op when unconfigured)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.utils.tracking import init_tracking, log_metrics, finish_tracking
 
 # ============================================================
 # Configuration
@@ -449,10 +454,12 @@ def main():
     warmup_steps = int(total_steps * WARMUP_RATIO)
 
     def get_lr(step):
-        if step < warmup_steps:
-            return LEARNING_RATE * step / max(warmup_steps, 1)
+        if warmup_steps > 0 and step < warmup_steps:
+            # Linear warmup; start at a small positive value so the first
+            # optimizer step is not wasted at lr=0.
+            return LEARNING_RATE * (step + 1) / warmup_steps
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return LEARNING_RATE * 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+        return LEARNING_RATE * 0.5 * (1 + math.cos(progress * math.pi))
 
     print(f"  Steps: {total_steps}, Warmup: {warmup_steps}")
     print(f"  Batch: {PER_DEVICE_BATCH_SIZE} × {GRADIENT_ACCUMULATION_STEPS}")
@@ -460,6 +467,29 @@ def main():
     # ============================================================
     # Training Loop
     # ============================================================
+    swanlab_run = init_tracking(
+        name=os.path.basename(OUTPUT_DIR.rstrip("/")) or "grpo",
+        config={
+            "model": MODEL_PATH,
+            "sft_checkpoint": SFT_CHECKPOINT,
+            "num_epochs": NUM_EPOCHS,
+            "batch_size": PER_DEVICE_BATCH_SIZE,
+            "grad_accum": GRADIENT_ACCUMULATION_STEPS,
+            "learning_rate": LEARNING_RATE,
+            "warmup_ratio": WARMUP_RATIO,
+            "num_generations": NUM_GENERATIONS,
+            "temperature": TEMPERATURE,
+            "beta": BETA,
+            "epsilon_low": EPSILON_LOW,
+            "epsilon_high": EPSILON_HIGH,
+            "max_turns": MAX_TURNS,
+            "max_completion_tokens": MAX_COMPLETION_TOKENS,
+            "num_samples": NUM_SAMPLES,
+            "total_steps": total_steps,
+        },
+        tags=["grpo", "search-r1", "hotpotqa"],
+    )
+
     print("\n" + "=" * 60)
     print("  Starting training")
     print("=" * 60)
@@ -470,103 +500,115 @@ def main():
     for epoch in range(NUM_EPOCHS):
         dataset = dataset.shuffle(seed=42 + epoch)
 
-        for batch_start in range(0, len(dataset), PER_DEVICE_BATCH_SIZE):
-            batch = dataset[batch_start:batch_start + PER_DEVICE_BATCH_SIZE]
+        # One optimizer step processes GRADIENT_ACCUMULATION_STEPS micro-batches
+        # of PER_DEVICE_BATCH_SIZE samples each.
+        step_size = PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
 
+        for batch_start in range(0, len(dataset), step_size):
             optimizer.zero_grad()
             batch_loss = 0.0
             all_rewards, all_fmt, all_acc, all_lengths = [], [], [], []
+            n_micro = 0
 
-            for sample_idx in range(len(batch['prompt'])):
-                item = batch['prompt'][sample_idx]
-                gt = batch['ground_truth'][sample_idx]
-                system_prompt = item['system']
-                question = item['question']
+            for micro in range(GRADIENT_ACCUMULATION_STEPS):
+                sample_start = batch_start + micro * PER_DEVICE_BATCH_SIZE
+                if sample_start >= len(dataset):
+                    break
+                n_micro += 1
+                batch = dataset[sample_start:sample_start + PER_DEVICE_BATCH_SIZE]
 
-                # Build prompt token IDs
-                prompt_ids = make_prompt_ids(tokenizer, system_prompt, question)
+                for sample_idx in range(len(batch['prompt'])):
+                    item = batch['prompt'][sample_idx]
+                    gt = batch['ground_truth'][sample_idx]
+                    system_prompt = item['system']
+                    question = item['question']
 
-                # Generate G completions for this prompt
-                group_turns = []
-                group_texts = []
-                group_old_lps = []
+                    # Build prompt token IDs
+                    prompt_ids = make_prompt_ids(tokenizer, system_prompt, question)
 
-                for g in range(NUM_GENERATIONS):
-                    turns, full_text = generate_with_search(
-                        model, tokenizer, prompt_ids, wiki,
-                        max_turns=MAX_TURNS,
-                        max_tokens_per_turn=MAX_TOKENS_PER_TURN,
-                        temperature=TEMPERATURE,
-                    )
-                    group_turns.append(turns)
-                    group_texts.append(full_text)
+                    # Generate G completions for this prompt
+                    group_turns = []
+                    group_texts = []
+                    group_old_lps = []
 
-                    # Old logprobs (detached)
-                    with torch.no_grad():
-                        old_lps = compute_all_logprobs(model, turns)
-                        group_old_lps.append(old_lps)
+                    for g in range(NUM_GENERATIONS):
+                        turns, full_text = generate_with_search(
+                            model, tokenizer, prompt_ids, wiki,
+                            max_turns=MAX_TURNS,
+                            max_tokens_per_turn=MAX_TOKENS_PER_TURN,
+                            temperature=TEMPERATURE,
+                        )
+                        group_turns.append(turns)
+                        group_texts.append(full_text)
 
-                    total_tokens = sum(len(t['gen_ids']) for t in turns)
-                    all_lengths.append(total_tokens)
+                        # Old logprobs (detached)
+                        with torch.no_grad():
+                            old_lps = compute_all_logprobs(model, turns)
+                            group_old_lps.append(old_lps)
 
-                # Compute rewards
-                group_rewards = []
-                group_fmt = []
-                group_acc = []
-                for g in range(NUM_GENERATIONS):
-                    fmt_r = format_reward(group_texts[g])
-                    acc_r = accuracy_reward(group_texts[g], gt)
-                    group_rewards.append(fmt_r + acc_r)
-                    group_fmt.append(fmt_r)
-                    group_acc.append(acc_r)
+                        total_tokens = sum(len(t['gen_ids']) for t in turns)
+                        all_lengths.append(total_tokens)
 
-                # Group-normalized advantages
-                rewards_t = torch.tensor(group_rewards, dtype=torch.float32)
-                mean_r = rewards_t.mean()
-                std_r = rewards_t.std()
-                advantages = (rewards_t - mean_r) / (std_r + 1e-4)
+                    # Compute rewards
+                    group_rewards = []
+                    group_fmt = []
+                    group_acc = []
+                    for g in range(NUM_GENERATIONS):
+                        fmt_r = format_reward(group_texts[g])
+                        acc_r = accuracy_reward(group_texts[g], gt)
+                        group_rewards.append(fmt_r + acc_r)
+                        group_fmt.append(fmt_r)
+                        group_acc.append(acc_r)
 
-                all_rewards.extend(group_rewards)
-                all_fmt.extend(group_fmt)
-                all_acc.extend(group_acc)
+                    # Group-normalized advantages
+                    rewards_t = torch.tensor(group_rewards, dtype=torch.float32)
+                    mean_r = rewards_t.mean()
+                    std_r = rewards_t.std()
+                    advantages = (rewards_t - mean_r) / (std_r + 1e-4)
 
-                # Free GPU memory from generation before computing loss
-                torch.cuda.empty_cache()
+                    all_rewards.extend(group_rewards)
+                    all_fmt.extend(group_fmt)
+                    all_acc.extend(group_acc)
 
-                # Compute GRPO loss for each completion
-                for g in range(NUM_GENERATIONS):
-                    turns = group_turns[g]
-                    old_lps = group_old_lps[g]
+                    # Free GPU memory from generation before computing loss
+                    torch.cuda.empty_cache()
 
-                    if len(old_lps) == 0:
-                        continue
+                    # Compute GRPO loss for each completion
+                    for g in range(NUM_GENERATIONS):
+                        turns = group_turns[g]
+                        old_lps = group_old_lps[g]
 
-                    # New logprobs (with grad) — same forward passes as generation
-                    new_lps = compute_all_logprobs(model, turns)
+                        if len(old_lps) == 0:
+                            continue
 
-                    if len(new_lps) == 0:
-                        continue
+                        # New logprobs (with grad) — same forward passes as generation
+                        new_lps = compute_all_logprobs(model, turns)
 
-                    # Ensure alignment
-                    min_len = min(len(new_lps), len(old_lps))
-                    new_lps = new_lps[:min_len]
-                    old_lps = old_lps[:min_len].to(model.device)
+                        if len(new_lps) == 0:
+                            continue
 
-                    adv = advantages[g]
-                    loss = grpo_loss(new_lps, old_lps, adv,
-                                     beta=BETA, epsilon_low=EPSILON_LOW,
-                                     epsilon_high=EPSILON_HIGH)
-                    loss = loss / (NUM_GENERATIONS * GRADIENT_ACCUMULATION_STEPS)
-                    loss.backward()
+                        # Ensure alignment
+                        min_len = min(len(new_lps), len(old_lps))
+                        new_lps = new_lps[:min_len]
+                        old_lps = old_lps[:min_len].to(model.device)
 
-                    batch_loss += loss.item() * NUM_GENERATIONS * GRADIENT_ACCUMULATION_STEPS
+                        adv = advantages[g]
+                        loss = grpo_loss(new_lps, old_lps, adv,
+                                         beta=BETA, epsilon_low=EPSILON_LOW,
+                                         epsilon_high=EPSILON_HIGH)
+                        loss = loss / (NUM_GENERATIONS * GRADIENT_ACCUMULATION_STEPS)
+                        loss.backward()
 
-            # Gradient step
+                        batch_loss += loss.item() * NUM_GENERATIONS * GRADIENT_ACCUMULATION_STEPS
+
+            if n_micro == 0:
+                break
+
+            # Gradient step — set LR before stepping so the schedule does not lag one step
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            optimizer.step()
-
             for pg in optimizer.param_groups:
                 pg['lr'] = get_lr(global_step)
+            optimizer.step()
             current_lr = optimizer.param_groups[0]['lr']
 
             global_step += 1
@@ -574,6 +616,15 @@ def main():
             # Logging
             if global_step % LOG_STEPS == 0:
                 n = max(len(all_rewards), 1)
+                metrics = {
+                    "loss": batch_loss,
+                    "reward": sum(all_rewards) / n,
+                    "reward_format": sum(all_fmt) / n,
+                    "reward_accuracy": sum(all_acc) / n,
+                    "completion_len": sum(all_lengths) / n,
+                    "lr": current_lr,
+                    "epoch": epoch + 1,
+                }
                 print(f"[Step {global_step}/{total_steps}] "
                       f"loss={batch_loss:.4f} "
                       f"rew={sum(all_rewards)/n:.3f} "
@@ -581,6 +632,7 @@ def main():
                       f"acc={sum(all_acc)/n:.3f} "
                       f"len={sum(all_lengths)/n:.0f} "
                       f"lr={current_lr:.2e}")
+                log_metrics(swanlab_run, metrics, step=global_step)
 
             # Checkpoint
             if global_step % SAVE_STEPS == 0:
@@ -602,6 +654,8 @@ def main():
     print(f"  {OUTPUT_DIR}")
     print(f"  Wiki cache: {wiki.get_stats()}")
     print("=" * 60)
+
+    finish_tracking(swanlab_run)
 
 
 if __name__ == "__main__":

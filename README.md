@@ -200,6 +200,7 @@ search-zero/
 | `uv sync --extra retrieval` | + BGE embedding + FAISS | 本地向量检索 |
 | `uv sync --extra train` | + torch(CUDA) / transformers / peft / datasets / accelerate / trl | SFT + GRPO 训练 |
 | `uv sync --extra wiki` | + `wikipedia` | 训练时调用真实 Wikipedia 搜索 |
+| `uv sync --extra tracking` | + SwanLab | 实验记录 |
 | `uv sync --extra server --extra demo` | + FastAPI / uvicorn / Streamlit | 起服务和 Demo |
 | `uv sync --all-extras` | 全部 | 完整开发环境 |
 
@@ -287,6 +288,36 @@ python scripts/run_eval.py data/hotpotqa_dev.json 100
 
 # 带 Wikipedia 搜索的评测
 python scripts/eval_with_real_wiki.py
+```
+
+### 实验记录（SwanLab）
+
+训练脚本自动接 SwanLab，**不装也能跑**——`app/utils/tracking.py` 里所有调用都是
+容错的，没配 key 时静默降级。
+
+```bash
+uv sync --extra tracking
+
+# 把 key 填进 .env
+SWANLAB_API_KEY=xxxxxxxx
+SWANLAB_PROJECT=search-zero
+# SWANLAB_MODE=online   # 上传云端；local 只写 ./swanlog；disabled 关闭
+```
+
+模式按优先级决定：`SWANLAB_MODE` 显式设置 > 有 key 则 `online` > 否则 `local`。
+所以**不填 key 也不会失败**，只会在本地 `./swanlog` 留一份记录。
+
+两条训练路径都接了：
+
+| 脚本 | 接入方式 |
+|------|----------|
+| `scripts/train_grpo_search.py` | 手写循环，直接 `swanlab.log()`，记录 `loss` / `reward` / `reward_format` / `reward_accuracy` / `completion_len` / `lr` / `epoch`，超参作为 run config |
+| `scripts/train_grpo.py` | trl 路径，用 transformers 原生 `report_to="swanlab"`（由 `tracking_enabled()` 决定，不可用时自动退回 `"none"`） |
+
+本地查看：
+
+```bash
+swanlab watch swanlog
 ```
 
 ---

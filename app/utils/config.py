@@ -36,6 +36,16 @@ class Config:
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))
 
+    # --- Tracking (SwanLab) ---
+    # api_key is only needed for mode=online. Without one the run stays local.
+    swanlab_api_key: Optional[str] = os.getenv("SWANLAB_API_KEY", None)
+    swanlab_project: str = os.getenv("SWANLAB_PROJECT", "search-zero")
+    swanlab_workspace: Optional[str] = os.getenv("SWANLAB_WORKSPACE", None)
+    # None -> resolve_mode() picks online when a key exists, else local.
+    swanlab_mode: Optional[str] = os.getenv("SWANLAB_MODE", None)
+    swanlab_logdir: str = os.getenv("SWANLAB_LOGDIR", "swanlog")
+    swanlab_experiment: Optional[str] = os.getenv("SWANLAB_EXP_NAME", None)
+
     # --- Paths ---
     data_dir: str = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data")
     faiss_index_path: str = os.path.join(data_dir, "faiss_index")

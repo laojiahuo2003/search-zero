@@ -23,6 +23,15 @@ from peft import PeftModel, PeftConfig
 from trl import GRPOConfig, GRPOTrainer
 from transformers import TrainerCallback
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.utils.tracking import tracking_enabled
+
+
+def _report_to() -> str:
+    """Report to SwanLab when it is installed and not disabled, else "none"."""
+    return "swanlab" if tracking_enabled() else "none"
+
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -37,7 +46,7 @@ GRPO_CONFIG = GRPOConfig(
     num_train_epochs=1,
     per_device_train_batch_size=1,
     gradient_accumulation_steps=4,
-    gradient_checkpointing=False,  # disabled: conflicts with PeftModel.enable_input_require_grads hook during recomputation
+    gradient_checkpointing=False,  # disabled: keep LoRA base frozen and avoid checkpoint/input-grad hook complexity
     bf16=True,
     learning_rate=1.0e-6,
     lr_scheduler_type="cosine",
@@ -50,7 +59,10 @@ GRPO_CONFIG = GRPOConfig(
     max_completion_length=1024,
     num_generations=2,  # generate 2 completions per prompt for GRPO
     temperature=0.9,  # enough exploration, system prompt now guides format
-    report_to="none",
+    # SwanLab tracking. "swanlab" needs the `tracking` extra and, for online
+    # mode, SWANLAB_API_KEY. Falls back to "none" when unavailable so this
+    # script still runs without swanlab installed.
+    report_to=_report_to(),
     # Memory optimizations
     use_vllm=False,  # set True if vLLM installed
 )
@@ -61,14 +73,15 @@ GRPO_CONFIG = GRPOConfig(
 
 def extract_answer_section(text: str) -> tuple:
     """Extract the ANSWER section from generated text.
-    Returns (answer_text, has_proper_format)"""
+    Returns (answer_text, (has_thought, has_action))"""
     # Check for ReAct structure
     has_thought = bool(re.search(r'THOUGHT\s*:', text, re.IGNORECASE))
     has_action = bool(re.search(r'ACTION\s*:', text, re.IGNORECASE))
 
-    # Extract ANSWER content
+    # Extract ANSWER content — capture until the next section marker (or end),
+    # so multi-line answers (e.g. with [1][2] citations) are kept intact.
     answer_match = re.search(
-        r'ACTION\s*:\s*ANSWER\s*:\s*(.+?)(?:\n|$|ACTION|THOUGHT)',
+        r'ACTION\s*:\s*ANSWER\s*:\s*(.+?)(?=\n\s*(?:ACTION|THOUGHT)\s*:|$)',
         text, re.IGNORECASE | re.DOTALL
     )
     if answer_match:
@@ -101,7 +114,7 @@ def format_reward(completions, **kwargs):
         if re.search(r'ACTION\s*:', text, re.IGNORECASE):
             score += 0.3
         if re.search(r'ANSWER\s*:', text, re.IGNORECASE):
-            score += 0.5  # brings full trajectory to 1.0+
+            score += 0.5  # full trajectory sums to 0.3+0.3+0.5=1.1, capped to 1.0 below
         rewards.append(min(1.0, score))  # cap at 1.0 for stability
     return rewards
 
@@ -255,21 +268,17 @@ def main():
     # Load SFT LoRA — keep as LoRA, do NOT merge (would OOM on 40GB)
     print("[3/5] Loading SFT LoRA adapter (keeping LoRA structure)...")
     model = PeftModel.from_pretrained(model, SFT_CHECKPOINT)
-    # Enable training for LoRA params
+    # Enable training for LoRA params (base weights stay frozen)
     for n, p in model.named_parameters():
         if 'lora' in n:
             p.requires_grad = True
-    # CRITICAL: enable_input_require_grads ensures gradient checkpointing
-    # produces gradients through LoRA layers. Without this, PyTorch checkpoint
-    # sees no requires_grad inputs and skips gradient computation entirely.
-    model.enable_input_require_grads()
+    # NOTE: gradient_checkpointing is disabled (see GRPO_CONFIG), so
+    # enable_input_require_grads() is unnecessary — gradients reach LoRA layers
+    # through the frozen base during normal backward.
     model.train()  # set training mode
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"  Trainable: {trainable/1e6:.1f}M / Total: {total/1e9:.2f}B")
-    # Verify gradient setup
-    emb = model.get_input_embeddings()
-    print(f"  Embedding requires_grad: {emb.weight.requires_grad}")
 
     # Load dataset
     print("[4/5] Loading GRPO dataset...")

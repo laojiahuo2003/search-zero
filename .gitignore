@@ -29,6 +29,7 @@ data/*.json
 
 # Outputs
 outputs/
+swanlog/
 
 # OS
 .DS_Store
