@@ -56,7 +56,16 @@ train = [
     "datasets>=3.0.0",
     "accelerate>=0.34.0",
     "trl>=0.11.0",
+    # trl only declares this as an extra, but grpo_trainer imports it
+    # unconditionally -- scripts/train_grpo.py fails without it.
+    "mergekit>=0.1.4",
 ]
+
+# NOTE: LLaMA-Factory (the LoRA SFT step) is deliberately NOT a dependency --
+# clone and run it separately. Adding it here drags in torchvision/torchaudio/
+# torchdata, whose PyPI builds are ABI-incompatible with torch+cu126
+# ("operator torchvision::nms does not exist"). The only contract with it is the
+# YAML schema in configs/sft_lora.yaml; this repo never imports it.
 
 dev = [
     "pytest>=8.0.0",

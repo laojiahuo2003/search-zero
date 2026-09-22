@@ -63,6 +63,10 @@ python scripts/generate_sft_data.py data/hotpotqa_dev.json 1000 -w 16
 llamafactory-cli train configs/sft_lora.yaml
 ```
 
+> LLaMA-Factory 需要单独安装（单独 clone 或用它的官方环境），它不是本项目的
+> 依赖——本项目只通过 `configs/sft_lora.yaml` 这个 YAML 契约和它交互，
+> 代码里没有任何 `import llamafactory`。
+
 #### Phase 3: GRPO 强化学习 ★
 
 这是项目的核心。用自定义训练循环实现 GRPO：
