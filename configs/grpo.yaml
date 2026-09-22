@@ -1,0 +1,49 @@
+# GRPO Training Config — Agentic RL Stage
+# Run AFTER SFT is complete. Requires the SFT checkpoint.
+#
+# For GRPO, LLaMA-Factory needs a reward function.
+# The reward model scores the agent's final answer against ground truth.
+#
+# Usage:
+#   1. First complete SFT training
+#   2. Then: llamafactory-cli train configs/grpo.yaml
+
+### model
+model_name_or_path: outputs/search_r1_sft/checkpoint-best
+trust_remote_code: true
+
+### dataset
+dataset: search_r1_sft
+dataset_dir: configs/
+template: qwen
+cutoff_len: 4096
+
+### training
+stage: grpo
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.0
+
+### hyperparameters
+learning_rate: 1.0e-6
+num_train_epochs: 1
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+bf16: true
+gradient_checkpointing: true
+
+### generation (for rollout)
+max_new_tokens: 1024
+temperature: 0.7
+top_p: 0.9
+
+### GRPO specific
+num_generations: 4
+max_completion_length: 1024
+
+### output
+output_dir: outputs/search_r1_grpo
+overwrite_output_dir: true
+report_to: none

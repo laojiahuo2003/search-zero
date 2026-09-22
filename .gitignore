@@ -1,0 +1,30 @@
+# Dependencies
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# Claude Code config
+.claude/
+
+# Data artifacts (generated)
+data/sft/
+data/*.jsonl
+data/*.json
+*.tar.gz
+
+# Outputs
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,44 @@
+# SFT Training Config — Search-R1 Agent Fine-tuning
+# Usage: llamafactory-cli train configs/sft_lora.yaml
+
+### model
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+trust_remote_code: true
+
+### dataset
+dataset: search_r1_sft
+dataset_dir: .
+template: qwen
+cutoff_len: 4096
+preprocessing_num_workers: 4
+
+### training
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target: all
+
+### hyperparameters
+learning_rate: 5.0e-5
+num_train_epochs: 3
+max_grad_norm: 1.0
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+warmup_ratio: 0.1
+lr_scheduler_type: cosine
+logging_steps: 10
+save_steps: 500
+save_total_limit: 2
+bf16: true
+gradient_checkpointing: true
+optim: adamw_torch
+packing: false
+neftune_noise_alpha: 5.0
+
+### output
+output_dir: /data/outputs/search_r1_sft
+overwrite_output_dir: true
+report_to: none
