@@ -1,8 +1,13 @@
 # Dependencies
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
+
+# uv
+.pytest_cache/
+.ruff_cache/
 
 # IDE
 .idea/

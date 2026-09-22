@@ -1,0 +1,95 @@
+[project]
+name = "search-zero"
+version = "0.1.0"
+description = "From-scratch GRPO RL pipeline and LangGraph ReAct agent for multi-turn search reasoning"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+keywords = ["reinforcement-learning", "grpo", "react-agent", "search", "llm"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+]
+
+# ---- Core: ReAct agent + OpenAI-compatible LLM + DuckDuckGo search. CPU-only. ----
+dependencies = [
+    "langgraph>=0.2.0",
+    "openai>=1.30.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "ddgs>=6.0.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+# Local dense retrieval (BGE embeddings + FAISS index). Used by app/retrieval/.
+retrieval = [
+    "sentence-transformers>=2.7.0",
+    "faiss-cpu>=1.8.0",
+]
+
+# REST/SSE service: app/api/main.py
+server = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+]
+
+# Streamlit demo: frontend/app.py
+demo = [
+    "streamlit>=1.32.0",
+]
+
+# Local Wikipedia search backend used by the GRPO rollout loop and evals.
+wiki = [
+    "wikipedia>=1.4.0",
+]
+
+# GPU training stack. Pulls CUDA torch from the pytorch index (see [tool.uv]).
+#   scripts/train_grpo.py        -> trl GRPOTrainer
+#   scripts/train_grpo_search.py -> hand-rolled GRPO loop (no trl needed)
+train = [
+    "torch>=2.6",
+    "transformers>=4.45.0",
+    "peft>=0.12.0",
+    "datasets>=3.0.0",
+    "accelerate>=0.34.0",
+    "trl>=0.11.0",
+]
+
+dev = [
+    "pytest>=8.0.0",
+]
+
+# Convenience: everything.
+all = [
+    "search-zero[retrieval,server,demo,wiki,train,dev]",
+]
+
+[tool.uv]
+# TUNA as the default index so plain PyPI is never contacted from CN networks.
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+# CUDA 12.6 wheels for torch (driver 610.88 / RTX 3080 10GB).
+# `explicit = true` means ONLY torch* comes from here; everything else uses tuna.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

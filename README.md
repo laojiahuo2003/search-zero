@@ -184,24 +184,43 @@ search-zero/
 
 ### 前置条件
 
-- Python 3.10+
-- GPU（SFT/GRPO 训练需要 ≥16GB VRAM，推理只需 CPU）
+- Python 3.11 / 3.12（由 `.python-version` 固定，uv 会自动装）
+- [uv](https://docs.astral.sh/uv/) — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- GPU：SFT/GRPO 训练需要 ≥16GB VRAM；纯 ReAct Agent 推理只需 CPU
+
+依赖拆成了 extra，按需安装，不必一次装全：
+
+| 命令 | 装了什么 | 适用场景 |
+|------|----------|----------|
+| `uv sync` | LangGraph Agent + OpenAI SDK + DuckDuckGo | 只想跑 Agent / 调 API |
+| `uv sync --extra retrieval` | + BGE embedding + FAISS | 本地向量检索 |
+| `uv sync --extra train` | + torch(CUDA) / transformers / peft / datasets / accelerate / trl | SFT + GRPO 训练 |
+| `uv sync --extra wiki` | + `wikipedia` | 训练时调用真实 Wikipedia 搜索 |
+| `uv sync --extra server --extra demo` | + FastAPI / uvicorn / Streamlit | 起服务和 Demo |
+| `uv sync --all-extras` | 全部 | 完整开发环境 |
+
+> ⚠️ `uv sync --extra X` 会**卸掉**其他没指定的 extra。要保留多个就用
+> `uv sync --all-extras`，或把 extra 并列写出：`uv sync --extra train --extra retrieval`。
 
 ```bash
-# 1. 创建虚拟环境
-python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # Linux/Mac
+# 1. 安装依赖（uv 会自动创建 .venv 并下载锁定版本的 Python）
+uv sync --all-extras
 
-# 2. 安装依赖
-pip install -r requirements.txt
-
-# 3. 配置环境变量
+# 2. 配置环境变量
 cp .env.example .env
 # 编辑 .env，填入 LLM API Key
 
-# 4. （可选）预下载 embedding 模型
-python scripts/download_models.py
+# 3. （可选）预下载 embedding 模型
+uv run python scripts/download_models.py
+```
+
+torch 固定走 `download.pytorch.org/whl/cu126`，其余包走清华源，见
+[pyproject.toml](pyproject.toml) 的 `[tool.uv]` 段。国内网络下无需额外配置。
+
+`uv.lock` 已提交，`uv sync` 会精确复现同一套版本。需要 pip 格式的依赖列表：
+
+```bash
+uv export --no-hashes -o requirements.txt
 ```
 
 ### 环境变量
