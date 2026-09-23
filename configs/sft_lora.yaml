@@ -7,7 +7,7 @@ trust_remote_code: true
 
 ### dataset
 dataset: search_r1_sft
-dataset_dir: .
+dataset_dir: data
 template: qwen
 cutoff_len: 4096
 preprocessing_num_workers: 4
@@ -39,6 +39,8 @@ packing: false
 neftune_noise_alpha: 5.0
 
 ### output
-output_dir: /data/outputs/search_r1_sft
+# Repo-relative by default so a bare `llamafactory-cli train` works.
+# scripts/train_sft.py overrides this with $SEARCH_ZERO_ROOT/outputs/...
+output_dir: outputs/search_r1_sft
 overwrite_output_dir: true
 report_to: none

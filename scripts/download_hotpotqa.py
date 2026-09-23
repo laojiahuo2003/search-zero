@@ -7,12 +7,13 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 from datasets import load_dataset
 
+from app.utils.config import get_config
+
 print("Loading HotpotQA (distractor, dev split)...")
 data = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation")
 qa = [{"question": d["question"], "answer": d["answer"]} for d in data]
 
-out_path = os.path.join(os.path.dirname(__file__), "..", "data", "hotpotqa_dev.json")
-out_path = os.path.abspath(out_path)
+out_path = get_config().hotpotqa_dev_path
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
 with open(out_path, "w", encoding="utf-8") as f:

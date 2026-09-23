@@ -21,10 +21,15 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.utils.config import get_config
+
+_cfg = get_config()
+
 # ============================================================
 # Config
 # ============================================================
-MODEL_PATH = "/data/models/qwen/Qwen2___5-7B-Instruct"
+MODEL_PATH = _cfg.base_model
 MAX_TURNS = 3
 MAX_TOKENS_PER_TURN = 256
 TEMPERATURE = 0.7  # Lower temp for eval (greedy-ish)
@@ -151,7 +156,7 @@ def contains_match(pred: str, gold: str) -> bool:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, default=None, help="LoRA checkpoint path")
-    parser.add_argument("--eval_data", type=str, default="/data/hotpotqa/eval.json")
+    parser.add_argument("--eval_data", type=str, default=_cfg.hotpotqa_eval_path)
     parser.add_argument("--wiki_url", type=str, default="http://127.0.0.1:18080/search")
     parser.add_argument("--output", type=str, default="eval_results.json")
     parser.add_argument("--max_samples", type=int, default=0, help="0 = all")

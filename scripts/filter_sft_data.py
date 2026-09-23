@@ -174,10 +174,11 @@ def main():
 
     config = get_config()
     client = OpenAI(api_key=config.llm_api_key, base_url=config.llm_base_url)
-    model = "deepseek-chat"  # non-reasoning model — cheaper and content is not empty
+    # Judge with the same model as the agent (LLM_MODEL from .env).
+    model = config.llm_model
 
     # Load SFT data
-    sft_path = "data/sft/sft_trajectories.jsonl"
+    sft_path = config.sft_trajectories_path
     if not os.path.exists(sft_path):
         print(f"ERROR: {sft_path} not found")
         sys.exit(1)
@@ -186,7 +187,7 @@ def main():
         samples = [json.loads(line) for line in f]
 
     # Load HotpotQA ground truth
-    gt_path = "data/hotpotqa_dev.json"
+    gt_path = config.hotpotqa_dev_path
     with open(gt_path, "r", encoding="utf-8") as f:
         gt_data = json.load(f)
     # Build lookup by question
@@ -276,14 +277,14 @@ def main():
     # Save filtered (only LLM-judged correct; unmatched kept as unverified)
     keep = judge_correct + unmatched
 
-    clean_path = "data/sft/sft_trajectories_filtered.jsonl"
+    clean_path = config.sft_filtered_path
     with open(clean_path, "w", encoding="utf-8") as f:
         for s in keep:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     # Also save all with correctness flags (for analysis)
     all_judged = judged + unmatched
-    judged_path = "data/sft/sft_trajectories_judged.jsonl"
+    judged_path = os.path.join(config.sft_data_dir, "sft_trajectories_judged.jsonl")
     with open(judged_path, "w", encoding="utf-8") as f:
         for s in all_judged:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")

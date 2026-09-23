@@ -35,16 +35,21 @@ from wiki_search import CachedWikiSearcher, LocalWikiSearcher
 
 # SwanLab tracking (optional — degrades to a no-op when unconfigured)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.utils.config import get_config
 from app.utils.tracking import init_tracking, log_metrics, finish_tracking
 
-# ============================================================
+_cfg = get_config()
+
+# ============================================
 # Configuration
-# ============================================================
-MODEL_PATH = "/data/models/qwen/Qwen2___5-7B-Instruct"
-SFT_CHECKPOINT = "/data/outputs/search_r1_sft"
-OUTPUT_DIR = "/data/outputs/search_r1_grpo_search"
-WIKI_CACHE_DIR = "/data/wiki_cache"
-HOTPOTQA_PATH = "/data/hotpotqa/train.json"
+# ============================================
+# All paths derive from SEARCH_ZERO_ROOT (see app/utils/config.py). Unset,
+# they resolve inside the repo, which is the historical layout.
+MODEL_PATH = _cfg.base_model
+SFT_CHECKPOINT = _cfg.sft_checkpoint
+OUTPUT_DIR = _cfg.grpo_output_dir
+WIKI_CACHE_DIR = _cfg.wiki_cache_dir
+HOTPOTQA_PATH = _cfg.hotpotqa_train_path
 
 NUM_EPOCHS = 1
 PER_DEVICE_BATCH_SIZE = 1
@@ -421,7 +426,7 @@ def main():
     # ---- 4. Wikipedia Search ----
     print("[4/6] Initializing Wikipedia searcher...")
     # Try local index first (no network needed, works behind GFW)
-    WIKI_INDEX_PATH = "/data/wiki_index.json"
+    WIKI_INDEX_PATH = _cfg.wiki_index_path
     if os.path.exists(WIKI_INDEX_PATH):
         wiki = LocalWikiSearcher(WIKI_INDEX_PATH)
         print(f"  Using LOCAL search: {wiki.get_stats()['articles']} articles")

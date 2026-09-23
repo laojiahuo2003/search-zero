@@ -111,6 +111,8 @@ def build_index(data_dir: str, num_train: int = 500, num_eval: int = 100):
 
 
 if __name__ == "__main__":
-    out_dir = os.path.join(os.path.dirname(__file__), "..", "data")
-    out_dir = os.path.abspath(out_dir)
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from app.utils.config import get_config
+
+    out_dir = get_config().data_dir
     build_index(out_dir, num_train=500, num_eval=100)

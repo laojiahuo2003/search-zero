@@ -24,7 +24,10 @@ from trl import GRPOConfig, GRPOTrainer
 from transformers import TrainerCallback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.utils.config import get_config
 from app.utils.tracking import tracking_enabled
+
+_cfg = get_config()
 
 
 def _report_to() -> str:
@@ -35,10 +38,11 @@ def _report_to() -> str:
 # ============================================================
 # Configuration
 # ============================================================
-MODEL_PATH = "/data/models/qwen/Qwen2___5-7B-Instruct"
-SFT_CHECKPOINT = "/data/outputs/search_r1_sft"
-DATA_PATH = "/data/sft/sft_trajectories_filtered.jsonl"
-OUTPUT_DIR = "/data/outputs/search_r1_grpo"
+# All paths derive from SEARCH_ZERO_ROOT (see app/utils/config.py).
+MODEL_PATH = _cfg.base_model
+SFT_CHECKPOINT = _cfg.sft_checkpoint
+DATA_PATH = _cfg.sft_filtered_path
+OUTPUT_DIR = os.path.join(_cfg.outputs_dir, "search_r1_grpo")
 
 # Training config
 GRPO_CONFIG = GRPOConfig(

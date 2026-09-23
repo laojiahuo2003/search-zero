@@ -27,6 +27,13 @@ data/*.jsonl
 data/*.json
 *.tar.gz
 
+# Artifacts produced outside the repo (SEARCH_ZERO_ROOT)
+models/
+wiki_cache/
+
+# LLaMA-Factory configs rendered by scripts/train_sft.py
+configs/generated/
+
 # Outputs
 outputs/
 swanlog/

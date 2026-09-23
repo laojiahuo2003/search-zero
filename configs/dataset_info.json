@@ -1,6 +1,6 @@
 {
   "search_r1_sft": {
-    "file_name": "/data/sft/sft_trajectories_filtered.jsonl",
+    "file_name": "sft/sft_trajectories_filtered.jsonl",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages"

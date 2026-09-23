@@ -20,6 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.agent.react_agent import ReactAgent
 from app.agent.prompts import REACT_SYSTEM_PROMPT
+from app.utils.config import get_config
+
+_cfg = get_config()
 
 BUILT_IN = [
     {"question": "What government position was held by the woman who portrayed Jane Roe in the 1997 film 'Roe vs. Wade'?", "answer": "district attorney"},
@@ -133,22 +136,53 @@ def main():
     else:
         qa_pairs = BUILT_IN[:args.limit]
 
-    output_dir = Path("data/sft")
+    output_dir = Path(_cfg.sft_data_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_samples = []
     success = 0
-    total = len(qa_pairs)
     output_path = output_dir / "sft_trajectories.jsonl"
 
-    print(f"Generating SFT data for {total} questions ({args.workers} workers)...\n")
+    # --- Resume support ---
+    # Load samples already saved so a re-run continues from where it
+    # stopped instead of starting over. The question is stored as the
+    # "Question: ..." user message inside each sample.
+    done_questions = set()
+    if output_path.exists() and output_path.stat().st_size > 0:
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sample = json.loads(line)
+                    all_samples.append(sample)
+                    for msg in sample.get("messages", []):
+                        if msg.get("role") == "user" and str(msg.get("content", "")).startswith("Question:"):
+                            done_questions.add(str(msg["content"])[len("Question:"):].strip())
+                            break
+                except Exception:
+                    continue
+
+    # Only a fresh run resets the file; resuming appends to what exists.
+    if not done_questions:
+        with open(output_path, "w", encoding="utf-8") as f:
+            pass
+
+    # Skip questions that were already completed in an earlier run.
+    pending = [(i, qa) for i, qa in enumerate(qa_pairs) if qa["question"] not in done_questions]
+    total = len(pending)
+    if done_questions:
+        print(f"Resuming: {len(done_questions)} already done, {total} remaining...\n")
+    else:
+        print(f"Generating SFT data for {total} questions ({args.workers} workers)...\n")
 
     start = time.time()
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(process_one, i + 1, total, qa["question"]): i
-            for i, qa in enumerate(qa_pairs)
+            for i, qa in pending
         }
         for future in as_completed(futures):
             try:
@@ -156,20 +190,20 @@ def main():
             except Exception as e:
                 # Worker crashed; log and continue
                 idx = futures[future] + 1
-                log(idx, total, qa_pairs[futures[future]]["question"], f"CRASH: {e}")
+                log(idx, total, pending[futures[future]][1]["question"], f"CRASH: {e}")
                 continue
             if result is not None:
                 all_samples.append(result)
                 success += 1
-            # Incremental save every 100 samples
-            if success % 100 == 0 and all_samples:
-                with open(output_path, "w", encoding="utf-8") as f:
-                    for sample in all_samples:
-                        f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                # Append each successful sample immediately so an interrupted
+                # run keeps everything finished so far.
+                with open(output_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
     elapsed = time.time() - start
 
-    # Final save
+    # Final save: overwrite with the full set so the file stays canonical
+    # even if incremental appends and final state ever diverge.
     with open(output_path, "w", encoding="utf-8") as f:
         for sample in all_samples:
             f.write(json.dumps(sample, ensure_ascii=False) + "\n")
@@ -180,6 +214,7 @@ def main():
 
     print(f"\n{'='*50}")
     print(f"Done: {success}/{total} success  |  {elapsed:.1f}s  |  {success/max(1,elapsed)*60:.0f} samples/min")
+    print(f"Total saved: {len(all_samples)} samples")
     print(f"Saved: {output_path}")
     print(f"       {inspect_path}")
 

@@ -195,7 +195,8 @@ class LocalWikiSearcher:
     Wikipedia article sentences extracted from HotpotQA.
 
     Usage:
-        searcher = LocalWikiSearcher("/data/wiki_index.json")
+        from app.utils.config import get_config
+        searcher = LocalWikiSearcher(get_config().wiki_index_path)
         result = searcher.search("Python programming")
     """
 
