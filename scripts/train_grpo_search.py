@@ -32,6 +32,10 @@ from peft import PeftModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wiki_search import CachedWikiSearcher, LocalWikiSearcher
+from credit_assignment import (
+    CreditConfig, get_credit_config, build_token_advantages,
+    rule_judge_turn, LLMTurnJudge,
+)
 
 # SwanLab tracking (optional — degrades to a no-op when unconfigured)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,6 +47,19 @@ _cfg = get_config()
 # ============================================
 # Configuration
 # ============================================
+# ============================================
+# Credit Assignment (CW-GRPO)
+# ============================================
+# Per-turn contribution weights reallocate the trajectory-level GRPO
+# advantage across turns (see credit_assignment.py). Configured via env
+# vars, also settable in .env:
+#   CREDIT_MODE=none|rule|llm         (default none -> vanilla GRPO)
+#   CREDIT_GAMMA=1.0                  softmax inverse temperature (>=10 hard)
+#   CREDIT_JUDGE_WORKERS=16           parallel LLM judge calls
+#   CREDIT_FALLBACK_UNIFORM=1         uniform weights when all credits are 0
+#   CREDIT_JUDGE_ONLY_POSITIVE_ADV=1  skip judging adv <= 0 trajectories
+CREDIT_CFG = get_credit_config()
+
 # All paths derive from SEARCH_ZERO_ROOT (see app/utils/config.py). Unset,
 # they resolve inside the repo, which is the historical layout.
 MODEL_PATH = _cfg.base_model
@@ -56,17 +73,29 @@ PER_DEVICE_BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 4
 LEARNING_RATE = 5.0e-7
 WARMUP_RATIO = 0.1
-NUM_GENERATIONS = 4  # More completions for better advantage signal
+NUM_GENERATIONS = 2  # Reduced from 4 for faster training (2x speedup)
 TEMPERATURE = 0.9
 BETA = 0.04
 EPSILON_LOW = 0.2
 EPSILON_HIGH = 0.28
-MAX_TURNS = 3                    # 3 turns: SEARCH → SEARCH → ANSWER (multi-hop)
-MAX_TOKENS_PER_TURN = 300        # 300 tokens/turn, 80G VRAM plenty
+MAX_TURNS = 3                    # Reduced from 3: SEARCH → ANSWER (still allows multi-hop)
+MAX_TOKENS_PER_TURN = 256        # Slightly reduced from 300 for speed
 MAX_COMPLETION_TOKENS = 3072  # 3 turns × 256 + obs overhead
 SAVE_STEPS = 500
 LOG_STEPS = 1
 NUM_SAMPLES = 500
+
+# Pack the G completions of one prompt into a single batched generate() call.
+# On a launch-bound GPU (measured: GFX-Uti 100% but Mem-Uti 8%, ~84us/kernel)
+# this amortises fixed kernel-launch overhead across G sequences. Output is
+# mathematically identical to G separate calls. Set False to A/B test.
+BATCHED_GENERATION = True
+
+# Attention backend. On ROCm, flash_attention_2's Composable Kernel kernel is
+# frequently SLOWER than PyTorch's native SDPA for single-stream decode
+# (observed ~10x). "sdpa" is the recommended default; try "flash_attention_2"
+# only if you benchmark it faster on your stack.
+ATTN_IMPLEMENTATION = "sdpa"
 
 # Qwen2.5 chat template markers (hardcoded for deterministic tokenization)
 CHAT_MARKERS = {
@@ -99,7 +128,7 @@ Important: Always cite your sources. Always end with ACTION: ANSWER:"""
 # ============================================================
 # Reward Functions
 # ============================================================
-
+# 提取答案
 def extract_answer(text: str) -> str:
     """Extract ANSWER content from generated text."""
     m = re.search(r'ACTION\s*:\s*ANSWER\s*:\s*(.+?)(?:\n\s*(?:ACTION|THOUGHT)|$)',
@@ -109,7 +138,7 @@ def extract_answer(text: str) -> str:
     m = re.search(r'ANSWER\s*:\s*(.+?)$', text, re.IGNORECASE | re.DOTALL)
     return m.group(1).strip() if m else ""
 
-
+# 格式分数
 def format_reward(text: str) -> float:
     """ReAct format compliance: THOUGHT +0.3, ACTION +0.3, ANSWER +0.5."""
     score = 0.0
@@ -121,7 +150,7 @@ def format_reward(text: str) -> float:
         score += 0.5
     return min(1.0, score)
 
-
+# 答案奖励
 def accuracy_reward(text: str, ground_truth: str) -> float:
     """Continuous QA reward: contains=0.7, EM=1.0, partial word overlap=0.1-0.5.
 
@@ -135,19 +164,19 @@ def accuracy_reward(text: str, ground_truth: str) -> float:
     ans_norm = normalize_answer(answer)
     gt_norm = normalize_answer(ground_truth)
 
-    # 1.0 = exact match
+    # 1.0 = exact match EM 精确匹配
     if ans_norm == gt_norm:
         return 1.0
 
-    # 0.7 = gold answer contained in prediction (longer prediction)
+    # 0.7 = gold answer contained in prediction (longer prediction) GT 包含于答案（答案更长更全）
     if gt_norm and gt_norm in ans_norm:
         return 0.7
 
-    # 0.5 = prediction contained in gold (partial but right direction)
+    # 0.5 = prediction contained in gold (partial but right direction 答案包含于 GT（方向对但不全）
     if ans_norm and ans_norm in gt_norm:
         return 0.5
 
-    # 0.1-0.4 = token overlap ratio (continuous fallback)
+    # 0.1-0.4 = token overlap ratio (continuous fallback)词重叠
     gt_words = set(ground_truth.lower().split())
     ans_words = set(answer.lower().split())
     if gt_words and ans_words:
@@ -206,23 +235,31 @@ def make_prompt_ids(tokenizer, system_prompt: str, question: str) -> list:
 # ============================================================
 
 def generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
-                         max_turns=3, max_tokens_per_turn=300, temperature=0.9):
+                         max_turns=3, max_tokens_per_turn=300, temperature=0.9,
+                         compute_logprobs=False):
     """Multi-turn generation with real Wikipedia search.
 
     Args:
         prompt_ids: list of token IDs for the initial prompt (includes asst_start)
         wiki_searcher: CachedWikiSearcher instance
+        compute_logprobs: if True, compute logprobs during generation (old_logprobs)
 
     Returns:
         turns: list of dicts, each with:
             'input_ids': list of token IDs (model input for this turn)
             'gen_ids': list of token IDs (model output for this turn)
             'text': str (decoded model output)
+            'old_logprobs': tensor (if compute_logprobs=True)
         all_gen_text: concatenated model-generated text (for reward)
     """
     turns = []
     current_ids = list(prompt_ids)  # accumulates across turns
     model_gen_texts = []
+
+    # Timing stats
+    time_gen = 0.0
+    time_search = 0.0
+    time_logprob = 0.0
 
     for turn_idx in range(max_turns):
         input_tensor = torch.tensor([current_ids], device=model.device)
@@ -235,16 +272,27 @@ def generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
             current_ids = input_tensor[0].tolist()
 
         # Generate
+        t0 = time.time()
         with torch.no_grad():
-            output = model.generate(
-                input_tensor,
-                max_new_tokens=max_tokens_per_turn,
-                temperature=temperature,
-                do_sample=True,
-                top_p=0.95,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
+            # Rollout MUST use the KV cache. main() disables use_cache for the
+            # training backward pass, but leaving it off here makes every decode
+            # step recompute attention over the whole prefix (O(n^2) per turn).
+            # Toggle it on for generation, then restore it.
+            prev_cache = model.config.use_cache
+            model.config.use_cache = True
+            try:
+                output = model.generate(
+                    input_tensor,
+                    max_new_tokens=max_tokens_per_turn,
+                    temperature=temperature,
+                    do_sample=True,
+                    top_p=0.95,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            finally:
+                model.config.use_cache = prev_cache
+        time_gen += time.time() - t0
 
         # Extract generated tokens
         gen_ids = output[0, input_tensor.shape[1]:].tolist()
@@ -253,11 +301,24 @@ def generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
 
         gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-        turns.append({
+        turn_data = {
             'input_ids': list(current_ids),
             'gen_ids': gen_ids,
             'text': gen_text,
-        })
+            'query': None,          # SEARCH query of this turn (if any)
+            'observation': None,    # retrieval result of this turn (if any)
+            'credit': None,         # CW-GRPO contribution weight (filled in Phase 2.5)
+        }
+
+        # Compute logprobs immediately after generation (for old_logprobs)
+        if compute_logprobs:
+            t0 = time.time()
+            with torch.no_grad():
+                old_lps = compute_turn_logprobs(model, current_ids, gen_ids)
+                turn_data['old_logprobs'] = old_lps.cpu()  # Move to CPU to save VRAM
+            time_logprob += time.time() - t0
+
+        turns.append(turn_data)
         model_gen_texts.append(gen_text)
 
         # Check for ANSWER
@@ -272,7 +333,12 @@ def generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
         if search_match:
             query = search_match.group(1).strip()
             if query:
+                t0 = time.time()
                 obs_text = wiki_searcher.search(query, top_k=3, sentences=3)
+                time_search += time.time() - t0
+                # Keep query + observation for CW-GRPO credit assignment
+                turn_data['query'] = query
+                turn_data['observation'] = obs_text
                 obs_ids = tokenize_observation(tokenizer, obs_text)
                 current_ids = current_ids + gen_ids + obs_ids
                 continue
@@ -281,7 +347,157 @@ def generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
         break
 
     all_gen_text = "\n".join(model_gen_texts)
+
+    # Store timing info for debugging
+    if hasattr(turns, '__timing__'):
+        turns.__timing__ = {'gen': time_gen, 'search': time_search, 'logprob': time_logprob}
+
     return turns, all_gen_text
+
+
+def batched_generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
+                                 num_generations=2, max_turns=3,
+                                 max_tokens_per_turn=256, temperature=0.9,
+                                 compute_logprobs=False):
+    """Batched multi-turn generation for G completions of the SAME prompt.
+
+    The single biggest win on a bandwidth-underutilised GPU: at batch=1 every
+    one of the ~700 kernels in a forward pass processes one token, so the fixed
+    launch overhead dominates (measured ~84us/kernel on ROCm). Packing the G
+    completions into one batch amortises that overhead without changing the
+    maths — the per-sequence output is identical to calling
+    generate_with_search() G times.
+
+    Left-padding is used so sequences of different lengths share a batch. HF
+    generate() handles cache positions correctly for left-padded inputs as long
+    as an explicit attention_mask is passed.
+
+    Returns:
+        all_turns: list of length num_generations; each element is a list of
+            turn dicts with the same schema as generate_with_search()
+        all_texts: list of length num_generations of joined generation text
+    """
+    B = num_generations
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    # All B sequences share one prompt; only the sampled rollout differs.
+    seq_ids = [list(prompt_ids) for _ in range(B)]
+    finished = [False] * B
+    all_turns = [[] for _ in range(B)]
+    all_texts = [[] for _ in range(B)]
+
+    # Left padding so batched generation is correct for ragged lengths.
+    prev_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
+    try:
+        for _turn_idx in range(max_turns):
+            active = [i for i in range(B) if not finished[i]]
+            if not active:
+                break
+
+            seqs = [seq_ids[i] for i in active]
+
+            # Same guard as the sequential path: cap context so a long
+            # observation cannot push the sequence past the truncation limit.
+            MAX_PROMPT_LENGTH = 2048
+            for i, s in zip(active, seqs):
+                if len(s) > MAX_PROMPT_LENGTH:
+                    seq_ids[i] = s[-MAX_PROMPT_LENGTH:]
+            seqs = [seq_ids[i] for i in active]
+
+            maxlen = max(len(s) for s in seqs)
+
+            input_ids = torch.full((len(active), maxlen), pad_id,
+                                   dtype=torch.long, device=model.device)
+            attn_mask = torch.zeros((len(active), maxlen),
+                                    dtype=torch.long, device=model.device)
+            for r, s in enumerate(seqs):
+                input_ids[r, maxlen - len(s):] = torch.tensor(s, device=model.device)
+                attn_mask[r, maxlen - len(s):] = 1
+
+            prev_cache = model.config.use_cache
+            model.config.use_cache = True
+            try:
+                with torch.no_grad():
+                    output = model.generate(
+                        input_ids,
+                        attention_mask=attn_mask,
+                        max_new_tokens=max_tokens_per_turn,
+                        temperature=temperature,
+                        do_sample=True,
+                        top_p=0.95,
+                        pad_token_id=pad_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                    )
+            finally:
+                model.config.use_cache = prev_cache
+
+            for r, i in enumerate(active):
+                gen_ids = output[r, maxlen:].tolist()
+
+                # A row that stopped early is padded out to the longest row in
+                # the batch. Truncate at the first EOS rather than stripping
+                # trailing pads: Qwen's pad_token_id == eos_token_id, so
+                # stripping pads would also discard a real EOS token and make
+                # this path disagree with the sequential one. Rows that ran to
+                # max_new_tokens contain no EOS and are left untouched.
+                eos_id = tokenizer.eos_token_id
+                if eos_id is not None and eos_id in gen_ids:
+                    gen_ids = gen_ids[:gen_ids.index(eos_id) + 1]
+
+                if not gen_ids:
+                    finished[i] = True
+                    continue
+
+                gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+                turn_data = {
+                    'input_ids': list(seq_ids[i]),
+                    'gen_ids': gen_ids,
+                    'text': gen_text,
+                    'query': None,          # SEARCH query of this turn (if any)
+                    'observation': None,    # retrieval result of this turn (if any)
+                    'credit': None,         # CW-GRPO contribution weight (filled in Phase 2.5)
+                }
+
+                if compute_logprobs:
+                    with torch.no_grad():
+                        old_lps = compute_turn_logprobs(model, seq_ids[i], gen_ids)
+                        turn_data['old_logprobs'] = old_lps.cpu()
+
+                all_turns[i].append(turn_data)
+                all_texts[i].append(gen_text)
+
+                # ANSWER ends the trajectory.
+                if re.search(r'ACTION\s*:\s*ANSWER\s*:', gen_text, re.IGNORECASE):
+                    finished[i] = True
+                    continue
+
+                # SEARCH appends an observation and continues.
+                search_match = re.search(
+                    r'ACTION\s*:\s*SEARCH\s*:\s*(.+?)(?:\n\s*(?:ACTION|THOUGHT|$)|$)',
+                    gen_text, re.IGNORECASE | re.DOTALL
+                )
+                if search_match:
+                    query = search_match.group(1).strip()
+                    if query:
+                        obs_text = wiki_searcher.search(query, top_k=3, sentences=3)
+                        # Keep query + observation for CW-GRPO credit assignment
+                        turn_data['query'] = query
+                        turn_data['observation'] = obs_text
+                        obs_ids = tokenize_observation(tokenizer, obs_text)
+                        seq_ids[i] = seq_ids[i] + gen_ids + obs_ids
+                        continue
+
+                # Neither SEARCH nor ANSWER — stop this sequence.
+                finished[i] = True
+    finally:
+        tokenizer.padding_side = prev_padding_side
+
+    return all_turns, ["\n".join(t) for t in all_texts]
 
 
 # ============================================================
@@ -309,17 +525,76 @@ def compute_turn_logprobs(model, input_ids, gen_ids):
     return token_logprobs
 
 
-def compute_all_logprobs(model, turns):
+def compute_all_logprobs(model, turns, compute_old=False):
     """Compute per-token logprobs for all turns (with grad if model is trainable).
 
     Uses the exact same input_ids and gen_ids as generation.
     Returns concatenated logprobs for all model-generated tokens.
+
+    Args:
+        compute_old: if True, also return old_logprobs from turns (no grad)
     """
     all_lps = []
+    all_old_lps = []
+
     for turn in turns:
         lps = compute_turn_logprobs(model, turn['input_ids'], turn['gen_ids'])
         all_lps.append(lps)
-    return torch.cat(all_lps) if all_lps else torch.tensor([], device=model.device)
+
+        if compute_old and 'old_logprobs' in turn:
+            all_old_lps.append(turn['old_logprobs'].to(model.device))
+
+    new_lps = torch.cat(all_lps) if all_lps else torch.tensor([], device=model.device)
+
+    if compute_old:
+        old_lps = torch.cat(all_old_lps) if all_old_lps else torch.tensor([], device=model.device)
+        return new_lps, old_lps
+
+    return new_lps
+
+
+def compute_batch_logprobs(model, all_turns_list):
+    """Batch compute logprobs for multiple completions to reduce forward passes.
+
+    Args:
+        all_turns_list: list of turns (each element is a list of turn dicts)
+
+    Returns:
+        list of (new_lps, old_lps) tuples, one per completion
+    """
+    results = []
+
+    # Collect all unique (input_ids, gen_ids) pairs to avoid redundant computation
+    unique_turns = []
+    turn_to_idx = {}
+
+    for turns in all_turns_list:
+        completion_indices = []
+        for turn in turns:
+            # Create hashable key
+            key = (tuple(turn['input_ids']), tuple(turn['gen_ids']))
+            if key not in turn_to_idx:
+                turn_to_idx[key] = len(unique_turns)
+                unique_turns.append(turn)
+            completion_indices.append(turn_to_idx[key])
+        results.append(completion_indices)
+
+    # Batch compute all unique turns (still one at a time due to varying lengths,
+    # but we deduplicate identical turns)
+    all_new_lps = []
+    for turn in unique_turns:
+        lps = compute_turn_logprobs(model, turn['input_ids'], turn['gen_ids'])
+        all_new_lps.append(lps)
+
+    # Reconstruct per-completion logprobs
+    final_results = []
+    for completion_idx, turns in enumerate(all_turns_list):
+        indices = results[completion_idx]
+        new_lps = torch.cat([all_new_lps[idx] for idx in indices]) if indices else torch.tensor([], device=model.device)
+        old_lps = torch.cat([turns[i]['old_logprobs'].to(model.device) for i in range(len(turns)) if 'old_logprobs' in turns[i]]) if turns else torch.tensor([], device=model.device)
+        final_results.append((new_lps, old_lps))
+
+    return final_results
 
 
 # ============================================================
@@ -333,7 +608,9 @@ def grpo_loss(per_token_logps, old_per_token_logps, advantages,
     Args:
         per_token_logps: (T,) current model logprobs
         old_per_token_logps: (T,) old logprobs (detached)
-        advantages: scalar advantage for this completion
+        advantages: scalar advantage for this completion, or a (T,) tensor of
+            per-token advantages (CW-GRPO credit reallocation broadcasts it
+            elementwise, matching the per-token logprobs)
         beta: KL penalty
         epsilon_low/high: clipping
     """
@@ -375,6 +652,23 @@ def load_hotpotqa_data(data_path: str, num_samples: int = 500):
     return dataset
 
 
+def preprocess_dataset(dataset, tokenizer):
+    """Pre-tokenize all prompts to avoid repeated tokenization."""
+    def tokenize_fn(example):
+        system_prompt = example['prompt']['system']
+        question = example['prompt']['question']
+        prompt_ids = make_prompt_ids(tokenizer, system_prompt, question)
+        return {
+            'prompt': example['prompt'],
+            'prompt_ids': prompt_ids,
+            'ground_truth': example['ground_truth'],
+        }
+
+    print("  Pre-tokenizing prompts...")
+    dataset = dataset.map(tokenize_fn, batched=False, desc="Tokenizing")
+    return dataset
+
+
 # ============================================================
 # Training
 # ============================================================
@@ -399,10 +693,21 @@ def main():
 
     # ---- 2. Model ----
     print("[2/6] Loading base model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, torch_dtype=torch.bfloat16,
-        device_map="auto", trust_remote_code=True,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_PATH, torch_dtype=torch.bfloat16,
+            device_map="auto", trust_remote_code=True,
+            attn_implementation=ATTN_IMPLEMENTATION,
+        )
+        print(f"  ✓ Attention backend: {ATTN_IMPLEMENTATION}")
+    except Exception as e:
+        print(f"  ✗ {ATTN_IMPLEMENTATION} not available: {e}")
+        print("  → Falling back to eager attention")
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_PATH, torch_dtype=torch.bfloat16,
+            device_map="auto", trust_remote_code=True,
+            attn_implementation="eager",
+        )
 
     # ---- 3. LoRA ----
     print("[3/6] Loading SFT LoRA...")
@@ -449,6 +754,7 @@ def main():
     # ---- 5. Data ----
     print("[5/6] Loading HotpotQA data...")
     dataset = load_hotpotqa_data(HOTPOTQA_PATH, num_samples=NUM_SAMPLES)
+    dataset = preprocess_dataset(dataset, tokenizer)
 
     # ---- 6. Optimizer ----
     print("[6/6] Setting up optimizer...")
@@ -491,9 +797,18 @@ def main():
             "max_completion_tokens": MAX_COMPLETION_TOKENS,
             "num_samples": NUM_SAMPLES,
             "total_steps": total_steps,
+            "credit_mode": CREDIT_CFG.mode,
+            "credit_gamma": CREDIT_CFG.gamma,
         },
         tags=["grpo", "search-r1", "hotpotqa"],
     )
+
+    # ---- Credit judge (CW-GRPO) ----
+    credit_judge = LLMTurnJudge() if CREDIT_CFG.mode == "llm" else None
+    if CREDIT_CFG.mode == "llm":
+        print(f"  Credit assignment: LLM judge ({credit_judge.model})")
+    elif CREDIT_CFG.mode == "rule":
+        print("  Credit assignment: deterministic rule-based judge")
 
     print("\n" + "=" * 60)
     print("  Starting training")
@@ -513,6 +828,7 @@ def main():
             optimizer.zero_grad()
             batch_loss = 0.0
             all_rewards, all_fmt, all_acc, all_lengths = [], [], [], []
+            all_credit_ret, all_credit_thk = [], []  # judge stats for CW-GRPO
             n_micro = 0
 
             for micro in range(GRADIENT_ACCUMULATION_STEPS):
@@ -525,36 +841,73 @@ def main():
                 for sample_idx in range(len(batch['prompt'])):
                     item = batch['prompt'][sample_idx]
                     gt = batch['ground_truth'][sample_idx]
-                    system_prompt = item['system']
+                    # question is needed by Phase 2.5 (credit judge), keep it
+                    # defined regardless of which prompt path is taken.
                     question = item['question']
 
-                    # Build prompt token IDs
-                    prompt_ids = make_prompt_ids(tokenizer, system_prompt, question)
+                    # Use pre-tokenized prompt_ids if available
+                    if 'prompt_ids' in batch and batch['prompt_ids'][sample_idx]:
+                        prompt_ids = batch['prompt_ids'][sample_idx]
+                    else:
+                        prompt_ids = make_prompt_ids(tokenizer, item['system'], question)
 
-                    # Generate G completions for this prompt
+                    # ============================================================
+                    # Phase 1: GENERATION — Generate G completions with old_logprobs
+                    # ============================================================
                     group_turns = []
                     group_texts = []
-                    group_old_lps = []
 
-                    for g in range(NUM_GENERATIONS):
-                        turns, full_text = generate_with_search(
+                    t0_gen = time.time()
+
+                    if BATCHED_GENERATION:
+                        group_turns, group_texts = batched_generate_with_search(
                             model, tokenizer, prompt_ids, wiki,
+                            num_generations=NUM_GENERATIONS,
                             max_turns=MAX_TURNS,
                             max_tokens_per_turn=MAX_TOKENS_PER_TURN,
                             temperature=TEMPERATURE,
+                            compute_logprobs=True,
                         )
-                        group_turns.append(turns)
-                        group_texts.append(full_text)
+                        for g in range(NUM_GENERATIONS):
+                            total_tokens = sum(len(t['gen_ids']) for t in group_turns[g])
+                            all_lengths.append(total_tokens)
 
-                        # Old logprobs (detached)
-                        with torch.no_grad():
-                            old_lps = compute_all_logprobs(model, turns)
-                            group_old_lps.append(old_lps)
+                        if global_step <= 2:
+                            print(f"  Batched gen ({NUM_GENERATIONS} seqs): "
+                                  f"{time.time() - t0_gen:.2f}s "
+                                  f"turns={[len(t) for t in group_turns]}")
+                    else:
+                        # Pre-allocate to reduce overhead
+                        group_turns = [None] * NUM_GENERATIONS
+                        group_texts = [None] * NUM_GENERATIONS
 
-                        total_tokens = sum(len(t['gen_ids']) for t in turns)
-                        all_lengths.append(total_tokens)
+                        for g in range(NUM_GENERATIONS):
+                            t_start = time.time()
+                            turns, full_text = generate_with_search(
+                                model, tokenizer, prompt_ids, wiki,
+                                max_turns=MAX_TURNS,
+                                max_tokens_per_turn=MAX_TOKENS_PER_TURN,
+                                temperature=TEMPERATURE,
+                                compute_logprobs=True,  # Compute old_logprobs during generation
+                            )
+                            t_gen = time.time() - t_start
+                            if global_step <= 2:  # 只在前几步打印详细信息
+                                print(f"    Gen {g+1}/{NUM_GENERATIONS}: {t_gen:.2f}s ({len(turns)} turns)")
 
-                    # Compute rewards
+                            group_turns[g] = turns
+                            group_texts[g] = full_text
+
+                            total_tokens = sum(len(t['gen_ids']) for t in turns)
+                            all_lengths.append(total_tokens)
+
+                    t_gen_total = time.time() - t0_gen
+                    if global_step <= 2:
+                        print(f"  Total generation: {t_gen_total:.2f}s")
+
+                    # ============================================================
+                    # Phase 2: REWARD — Compute rewards and advantages
+                    # ============================================================
+                    t0_reward = time.time()
                     group_rewards = []
                     group_fmt = []
                     group_acc = []
@@ -566,6 +919,11 @@ def main():
                         group_acc.append(acc_r)
 
                     # Group-normalized advantages
+                    # Note: upstream CW-GRPO normalizes over answer_reward
+                    # (binary EM) only; we keep search-zero's (format +
+                    # accuracy) advantage — format is a first-class training
+                    # signal here and the reallocation in Phase 2.5/3 does
+                    # not depend on which signal produced the advantage.
                     rewards_t = torch.tensor(group_rewards, dtype=torch.float32)
                     mean_r = rewards_t.mean()
                     std_r = rewards_t.std()
@@ -575,29 +933,78 @@ def main():
                     all_fmt.extend(group_fmt)
                     all_acc.extend(group_acc)
 
-                    # Free GPU memory from generation before computing loss
-                    torch.cuda.empty_cache()
+                    t_reward = time.time() - t0_reward
+                    if global_step <= 2:
+                        print(f"  Reward computation: {t_reward:.2f}s")
 
-                    # Compute GRPO loss for each completion
+                    # ============================================================
+                    # Phase 2.5: CREDIT — per-turn contribution weights (CW-GRPO)
+                    # ============================================================
+                    # Official CW-GRPO: judge every non-final search turn with a
+                    # binary (retrieval x thinking) score, normalize within the
+                    # trajectory, then reallocate the trajectory advantage across
+                    # turns. Negative-advantage trajectories keep the broadcast
+                    # advantage unchanged, so they are not judged at all.
+                    if CREDIT_CFG.mode != "none":
+                        t0_credit = time.time()
+                        question = batch['prompt'][sample_idx]['question']
+                        credit_jobs = []  # (g, turn_idx) awaiting the LLM judge
+                        for g in range(NUM_GENERATIONS):
+                            turns = group_turns[g]
+                            if len(turns) < 2:
+                                continue  # single turn: nothing to reallocate
+                            if advantages[g] <= 0 and CREDIT_CFG.judge_only_positive_adv:
+                                continue  # never reallocated -> skip the judge
+                            for idx in range(len(turns) - 1):
+                                if not turns[idx].get('query'):
+                                    # No SEARCH in this turn: nothing to credit.
+                                    turns[idx]['credit'] = 0.0
+                                    continue
+                                if CREDIT_CFG.mode == "rule":
+                                    ret, thk = rule_judge_turn(question, gt, turns, idx)
+                                    turns[idx]['credit'] = float(ret * thk)
+                                    all_credit_ret.append(ret)
+                                    all_credit_thk.append(thk)
+                                else:
+                                    credit_jobs.append((g, idx))
+                        if credit_jobs:
+                            results = credit_judge.judge_many(
+                                [(question, group_turns[g], idx) for g, idx in credit_jobs],
+                                workers=CREDIT_CFG.judge_workers,
+                            )
+                            for (g, idx), (ret, thk) in zip(credit_jobs, results):
+                                group_turns[g][idx]['credit'] = float(ret * thk)
+                                all_credit_ret.append(ret)
+                                all_credit_thk.append(thk)
+                        if global_step <= 2:
+                            print(f"  Credit assignment: {time.time() - t0_credit:.2f}s")
+
+                    # ============================================================
+                    # Phase 3: LEARNING — Batch compute GRPO loss with new_logprobs
+                    # ============================================================
+                    # Batch compute all logprobs at once (reduces forward passes)
+                    t0_logprob = time.time()
+                    batch_logprobs = compute_batch_logprobs(model, group_turns)
+                    t_logprob = time.time() - t0_logprob
+                    if global_step <= 2:
+                        print(f"  Logprobs computation: {t_logprob:.2f}s")
+
+                    t0_loss = time.time()
                     for g in range(NUM_GENERATIONS):
-                        turns = group_turns[g]
-                        old_lps = group_old_lps[g]
+                        new_lps, old_lps = batch_logprobs[g]
 
-                        if len(old_lps) == 0:
+                        if len(new_lps) == 0 or len(old_lps) == 0:
                             continue
 
-                        # New logprobs (with grad) — same forward passes as generation
-                        new_lps = compute_all_logprobs(model, turns)
-
-                        if len(new_lps) == 0:
-                            continue
-
-                        # Ensure alignment
-                        min_len = min(len(new_lps), len(old_lps))
-                        new_lps = new_lps[:min_len]
-                        old_lps = old_lps[:min_len].to(model.device)
-
-                        adv = advantages[g]
+                        if CREDIT_CFG.mode != "none":
+                            # CW-GRPO: reallocate the trajectory advantage across
+                            # turns. Token order matches the concatenated
+                            # per-turn logprobs in new_lps.
+                            adv = build_token_advantages(
+                                group_turns[g], float(advantages[g]), CREDIT_CFG
+                            ).to(model.device)
+                        else:
+                            adv = advantages[g]
                         loss = grpo_loss(new_lps, old_lps, adv,
                                          beta=BETA, epsilon_low=EPSILON_LOW,
                                          epsilon_high=EPSILON_HIGH)
@@ -605,6 +1012,10 @@ def main():
                         loss.backward()
 
                         batch_loss += loss.item() * NUM_GENERATIONS * GRADIENT_ACCUMULATION_STEPS
+
+                    t_loss = time.time() - t0_loss
+                    if global_step <= 2:
+                        print(f"  Loss & backward: {t_loss:.2f}s")
 
             if n_micro == 0:
                 break
@@ -630,6 +1041,9 @@ def main():
                     "lr": current_lr,
                     "epoch": epoch + 1,
                 }
+                if all_credit_ret:
+                    metrics["credit_retrieval_mean"] = sum(all_credit_ret) / len(all_credit_ret)
+                    metrics["credit_thinking_mean"] = sum(all_credit_thk) / len(all_credit_thk)
                 print(f"[Step {global_step}/{total_steps}] "
                       f"loss={batch_loss:.4f} "
                       f"rew={sum(all_rewards)/n:.3f} "
