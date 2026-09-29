@@ -21,7 +21,7 @@ from scripts.credit_assignment import (
     CreditConfig,
     get_credit_config,
 )
-from scripts.train_grpo_search import (
+from scripts.train_grpo_search_MI300X import (
     grpo_loss,
     format_reward,
     accuracy_reward,

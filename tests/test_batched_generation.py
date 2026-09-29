@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from scripts.train_grpo_search import (
+from scripts.train_grpo_search_MI300X import (
     batched_generate_with_search,
     batched_generate_multi_prompt,
 )
