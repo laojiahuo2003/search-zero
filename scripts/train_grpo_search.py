@@ -71,7 +71,11 @@ WIKI_CACHE_DIR = _cfg.wiki_cache_dir
 HOTPOTQA_PATH = _cfg.hotpotqa_train_path
 
 NUM_EPOCHS = 1
-PER_DEVICE_BATCH_SIZE = 1
+# Samples per micro-batch. With BATCHED_GENERATION on, the P samples x G
+# completions are left-padded into ONE generate() call (P x G sequences);
+# the group-normalized advantage is still computed per sample. 500 samples /
+# (4 x 4) = 31 steps/epoch at ~95s/step => ~50 min/epoch.
+PER_DEVICE_BATCH_SIZE = 4
 GRADIENT_ACCUMULATION_STEPS = 4
 LEARNING_RATE = 5.0e-7
 WARMUP_RATIO = 0.1
@@ -87,10 +91,13 @@ SAVE_STEPS = 500
 LOG_STEPS = 1
 NUM_SAMPLES = 500
 
-# Pack the G completions of one prompt into a single batched generate() call.
+# Pack ALL sequences of one micro-batch (PER_DEVICE_BATCH_SIZE samples x
+# NUM_GENERATIONS completions) into a single batched generate() call.
 # On a launch-bound GPU (measured: GFX-Uti 100% but Mem-Uti 8%, ~84us/kernel)
-# this amortises fixed kernel-launch overhead across G sequences. Output is
-# mathematically identical to G separate calls. Set False to A/B test.
+# this amortises fixed kernel-launch overhead across P x G sequences. Output
+# is mathematically identical to per-sample batched calls: each row is an
+# independent trajectory, group normalization is per sample. Set False to
+# A/B test against the sequential path.
 BATCHED_GENERATION = True
 
 # Attention backend. On ROCm, flash_attention_2's Composable Kernel kernel is
@@ -357,35 +364,53 @@ def generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
     return turns, all_gen_text
 
 
-def batched_generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
-                                 num_generations=2, max_turns=3,
-                                 max_tokens_per_turn=256, temperature=0.9,
-                                 compute_logprobs=False):
-    """Batched multi-turn generation for G completions of the SAME prompt.
+def batched_generate_multi_prompt(model, tokenizer, prompt_ids_list,
+                                  wiki_searcher, num_generations=2,
+                                  max_turns=3, max_tokens_per_turn=256,
+                                  temperature=0.9, compute_logprobs=False):
+    """Batched multi-turn generation for P prompts x G completions.
 
-    The single biggest win on a bandwidth-underutilised GPU: at batch=1 every
-    one of the ~700 kernels in a forward pass processes one token, so the fixed
-    launch overhead dominates (measured ~84us/kernel on ROCm). Packing the G
-    completions into one batch amortises that overhead without changing the
-    maths — the per-sequence output is identical to calling
-    generate_with_search() G times.
+    Generalises the single-prompt batched path to MULTIPLE prompts: the
+    P x G sequences are left-padded into ONE batched generate() call per
+    turn. On a bandwidth-underutilised GPU (at batch=1 every one of the
+    ~700 kernels in a forward pass processes one token, so the fixed
+    launch overhead dominates — measured ~84us/kernel on ROCm), this
+    amortises that overhead across P x G rows instead of G without
+    changing the maths: each row is an independent trajectory, and the
+    per-sequence output is identical to calling the single-prompt
+    batched_generate_with_search() once per prompt.
 
-    Left-padding is used so sequences of different lengths share a batch. HF
-    generate() handles cache positions correctly for left-padded inputs as long
-    as an explicit attention_mask is passed.
+    Left-padding is used so sequences of different lengths share a batch.
+    HF generate() handles cache positions correctly for left-padded inputs
+    as long as an explicit attention_mask is passed.
+
+    Row ordering contract (sample-major, CRITICAL for regrouping):
+        row = s * num_generations + g   for sample s in [0, P), completion g
+    i.e. all G completions of sample 0 occupy the first G rows, then
+    sample 1, and so on.
+
+    Args:
+        prompt_ids_list: list of P prompt token-id lists (one per sample)
+        num_generations: G completions to sample per prompt
 
     Returns:
-        all_turns: list of length num_generations; each element is a list of
-            turn dicts with the same schema as generate_with_search()
-        all_texts: list of length num_generations of joined generation text
+        all_turns: list of length P x G; all_turns[s*G + g] is the turn-dict
+            list for the g-th completion of the s-th prompt (same schema as
+            generate_with_search())
+        all_texts: list of length P x G of joined generation text
     """
-    B = num_generations
+    P = len(prompt_ids_list)
+    if P == 0:
+        return [], []
+    B = P * num_generations
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
 
-    # All B sequences share one prompt; only the sampled rollout differs.
-    seq_ids = [list(prompt_ids) for _ in range(B)]
+    # Sample-major row order: rows s*G .. s*G+G-1 hold the G completions of
+    # prompt s. Different prompts never share a row.
+    seq_ids = [list(prompt_ids_list[s])
+               for s in range(P) for _ in range(num_generations)]
     finished = [False] * B
     all_turns = [[] for _ in range(B)]
     all_texts = [[] for _ in range(B)]
@@ -500,6 +525,26 @@ def batched_generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
         tokenizer.padding_side = prev_padding_side
 
     return all_turns, ["\n".join(t) for t in all_texts]
+
+
+def batched_generate_with_search(model, tokenizer, prompt_ids, wiki_searcher,
+                                 num_generations=2, max_turns=3,
+                                 max_tokens_per_turn=256, temperature=0.9,
+                                 compute_logprobs=False):
+    """Batched multi-turn generation for G completions of the SAME prompt.
+
+    Thin wrapper over batched_generate_multi_prompt() with a single prompt:
+    identical behaviour and return shape (lists of length num_generations).
+    """
+    all_turns, all_texts = batched_generate_multi_prompt(
+        model, tokenizer, [prompt_ids], wiki_searcher,
+        num_generations=num_generations,
+        max_turns=max_turns,
+        max_tokens_per_turn=max_tokens_per_turn,
+        temperature=temperature,
+        compute_logprobs=compute_logprobs,
+    )
+    return all_turns, all_texts
 
 
 # ============================================================
@@ -832,6 +877,12 @@ def main():
             all_rewards, all_fmt, all_acc, all_lengths = [], [], [], []
             all_credit_ret, all_credit_thk = [], []  # judge stats for CW-GRPO
             n_micro = 0
+            # Completions actually generated in this step (P x G per micro).
+            # Each completion's loss is divided by this so a step's gradient is
+            # the average over all its completions, invariant to
+            # PER_DEVICE_BATCH_SIZE / GRADIENT_ACCUMULATION_STEPS and to a
+            # ragged tail micro-batch.
+            total_completions = 0
 
             for micro in range(GRADIENT_ACCUMULATION_STEPS):
                 sample_start = batch_start + micro * PER_DEVICE_BATCH_SIZE
@@ -840,71 +891,88 @@ def main():
                 n_micro += 1
                 batch = dataset[sample_start:sample_start + PER_DEVICE_BATCH_SIZE]
 
+                # ---- Gather this micro's prompts/questions/golds ----
+                micro_prompt_ids, micro_questions, micro_gts = [], [], []
                 for sample_idx in range(len(batch['prompt'])):
                     item = batch['prompt'][sample_idx]
-                    gt = batch['ground_truth'][sample_idx]
                     # question is needed by Phase 2.5 (credit judge), keep it
                     # defined regardless of which prompt path is taken.
                     question = item['question']
+                    micro_questions.append(question)
+                    micro_gts.append(batch['ground_truth'][sample_idx])
 
                     # Use pre-tokenized prompt_ids if available
                     if 'prompt_ids' in batch and batch['prompt_ids'][sample_idx]:
-                        prompt_ids = batch['prompt_ids'][sample_idx]
+                        micro_prompt_ids.append(batch['prompt_ids'][sample_idx])
                     else:
-                        prompt_ids = make_prompt_ids(tokenizer, item['system'], question)
-
-                    # ============================================================
-                    # Phase 1: GENERATION — Generate G completions with old_logprobs
-                    # ============================================================
-                    group_turns = []
-                    group_texts = []
-
-                    t0_gen = time.time()
-
-                    if BATCHED_GENERATION:
-                        group_turns, group_texts = batched_generate_with_search(
-                            model, tokenizer, prompt_ids, wiki,
-                            num_generations=NUM_GENERATIONS,
-                            max_turns=MAX_TURNS,
-                            max_tokens_per_turn=MAX_TOKENS_PER_TURN,
-                            temperature=TEMPERATURE,
-                            compute_logprobs=True,
+                        micro_prompt_ids.append(
+                            make_prompt_ids(tokenizer, item['system'], question)
                         )
-                        for g in range(NUM_GENERATIONS):
-                            total_tokens = sum(len(t['gen_ids']) for t in group_turns[g])
-                            all_lengths.append(total_tokens)
+                n_samples = len(micro_prompt_ids)
 
-                        if global_step <= 2:
-                            print(f"  Batched gen ({NUM_GENERATIONS} seqs): "
-                                  f"{time.time() - t0_gen:.2f}s "
-                                  f"turns={[len(t) for t in group_turns]}")
-                    else:
-                        # Pre-allocate to reduce overhead
-                        group_turns = [None] * NUM_GENERATIONS
-                        group_texts = [None] * NUM_GENERATIONS
+                # ============================================================
+                # Phase 1: GENERATION — n_samples x G completions in ONE batch
+                # ============================================================
+                # All n_samples x G sequences of this micro are left-padded into
+                # one generate() call per turn; row = s*G + g, regrouped below.
+                # Each row is an independent trajectory, so outputs equal
+                # per-sample batched calls. A launch-bound GPU amortises its
+                # ~84us/kernel overhead across n_samples x G rows here.
+                t0_gen = time.time()
+                micro_turns = []  # [sample][completion] = turn-dict list
+                micro_texts = []  # [sample][completion] = joined text
 
+                if BATCHED_GENERATION:
+                    flat_turns, flat_texts = batched_generate_multi_prompt(
+                        model, tokenizer, micro_prompt_ids, wiki,
+                        num_generations=NUM_GENERATIONS,
+                        max_turns=MAX_TURNS,
+                        max_tokens_per_turn=MAX_TOKENS_PER_TURN,
+                        temperature=TEMPERATURE,
+                        compute_logprobs=True,
+                    )
+                    for s in range(n_samples):
+                        base = s * NUM_GENERATIONS
+                        micro_turns.append([flat_turns[base + g]
+                                            for g in range(NUM_GENERATIONS)])
+                        micro_texts.append([flat_texts[base + g]
+                                            for g in range(NUM_GENERATIONS)])
+                else:
+                    # A/B baseline: per-sample, per-completion sequential gen.
+                    for s in range(n_samples):
+                        gturns, gtexts = [], []
                         for g in range(NUM_GENERATIONS):
-                            t_start = time.time()
                             turns, full_text = generate_with_search(
-                                model, tokenizer, prompt_ids, wiki,
+                                model, tokenizer, micro_prompt_ids[s], wiki,
                                 max_turns=MAX_TURNS,
                                 max_tokens_per_turn=MAX_TOKENS_PER_TURN,
                                 temperature=TEMPERATURE,
-                                compute_logprobs=True,  # Compute old_logprobs during generation
+                                compute_logprobs=True,  # old_logprobs during generation
                             )
-                            t_gen = time.time() - t_start
-                            if global_step <= 2:  # 只在前几步打印详细信息
-                                print(f"    Gen {g+1}/{NUM_GENERATIONS}: {t_gen:.2f}s ({len(turns)} turns)")
+                            gturns.append(turns)
+                            gtexts.append(full_text)
+                        micro_turns.append(gturns)
+                        micro_texts.append(gtexts)
 
-                            group_turns[g] = turns
-                            group_texts[g] = full_text
+                total_completions += n_samples * NUM_GENERATIONS
+                if global_step <= 2:
+                    print(f"  Batched gen ({n_samples}x{NUM_GENERATIONS} seqs): "
+                          f"{time.time() - t0_gen:.2f}s "
+                          f"turns={[len(t) for ts in micro_turns for t in ts]}")
 
-                            total_tokens = sum(len(t['gen_ids']) for t in turns)
-                            all_lengths.append(total_tokens)
+                # Phases 2/2.5/3 run per sample (group normalization is
+                # per-sample by definition). Timers accumulate across samples
+                # and are printed once per micro.
+                t_reward_acc = t_credit_acc = t_logprob_acc = t_loss_acc = 0.0
+                for s in range(n_samples):
+                    group_turns = micro_turns[s]
+                    group_texts = micro_texts[s]
+                    gt = micro_gts[s]
+                    question = micro_questions[s]
 
-                    t_gen_total = time.time() - t0_gen
-                    if global_step <= 2:
-                        print(f"  Total generation: {t_gen_total:.2f}s")
+                    for g in range(NUM_GENERATIONS):
+                        total_tokens = sum(len(t['gen_ids']) for t in group_turns[g])
+                        all_lengths.append(total_tokens)
 
                     # ============================================================
                     # Phase 2: REWARD — Compute rewards and advantages
@@ -935,9 +1003,7 @@ def main():
                     all_fmt.extend(group_fmt)
                     all_acc.extend(group_acc)
 
-                    t_reward = time.time() - t0_reward
-                    if global_step <= 2:
-                        print(f"  Reward computation: {t_reward:.2f}s")
+                    t_reward_acc += time.time() - t0_reward
 
                     # ============================================================
                     # Phase 2.5: CREDIT — per-turn contribution weights (CW-GRPO)
@@ -949,7 +1015,6 @@ def main():
                     # advantage unchanged, so they are not judged at all.
                     if CREDIT_CFG.mode != "none":
                         t0_credit = time.time()
-                        question = batch['prompt'][sample_idx]['question']
                         credit_jobs = []  # (g, turn_idx) awaiting the LLM judge
                         for g in range(NUM_GENERATIONS):
                             turns = group_turns[g]
@@ -980,8 +1045,7 @@ def main():
                                 group_turns[g][idx]['credit'] = float(ret * thk)
                                 all_credit_ret.append(ret)
                                 all_credit_thk.append(thk)
-                        if global_step <= 2:
-                            print(f"  Credit assignment: {time.time() - t0_credit:.2f}s")
+                        t_credit_acc += time.time() - t0_credit
 
                     # ============================================================
                     # Phase 3: LEARNING — Batch compute GRPO loss with new_logprobs
@@ -989,9 +1053,7 @@ def main():
                     # Batch compute all logprobs at once (reduces forward passes)
                     t0_logprob = time.time()
                     batch_logprobs = compute_batch_logprobs(model, group_turns)
-                    t_logprob = time.time() - t0_logprob
-                    if global_step <= 2:
-                        print(f"  Logprobs computation: {t_logprob:.2f}s")
+                    t_logprob_acc += time.time() - t0_logprob
 
                     t0_loss = time.time()
                     for g in range(NUM_GENERATIONS):
@@ -1012,14 +1074,23 @@ def main():
                         loss = grpo_loss(new_lps, old_lps, adv,
                                          beta=BETA, epsilon_low=EPSILON_LOW,
                                          epsilon_high=EPSILON_HIGH)
-                        loss = loss / (NUM_GENERATIONS * GRADIENT_ACCUMULATION_STEPS)
+                        # Divide by the completions in the WHOLE step (all
+                        # micros) so a step's gradient is the average over
+                        # its completions, invariant to PER_DEVICE_BATCH_SIZE
+                        # and GRADIENT_ACCUMULATION_STEPS.
+                        loss = loss / total_completions
                         loss.backward()
 
-                        batch_loss += loss.item() * NUM_GENERATIONS * GRADIENT_ACCUMULATION_STEPS
+                        batch_loss += loss.item() * total_completions
 
-                    t_loss = time.time() - t0_loss
-                    if global_step <= 2:
-                        print(f"  Loss & backward: {t_loss:.2f}s")
+                    t_loss_acc += time.time() - t0_loss
+
+                if global_step <= 2:
+                    print(f"  Reward computation: {t_reward_acc:.2f}s")
+                    if CREDIT_CFG.mode != "none":
+                        print(f"  Credit assignment: {t_credit_acc:.2f}s")
+                    print(f"  Logprobs computation: {t_logprob_acc:.2f}s")
+                    print(f"  Loss & backward: {t_loss_acc:.2f}s")
 
             if n_micro == 0:
                 break
