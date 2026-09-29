@@ -1,7 +1,7 @@
 """
 Filter SFT trajectories by comparing extracted final answers against HotpotQA ground truth.
 Uses an LLM judge (cheap + fast) for answer extraction and correctness comparison.
-
+SFT 数据管线的 质量闸门 ：采完的轨迹不能全拿去训练，它用"硬规则 + LLM 裁判"双层过滤，只留下答案正确的轨迹。
 Usage:
     python scripts/filter_sft_data.py                     # all 975 samples
     python scripts/filter_sft_data.py -w 32               # 32 concurrent workers

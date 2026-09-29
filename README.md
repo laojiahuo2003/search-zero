@@ -378,13 +378,25 @@ llamafactory-cli train configs/sft_lora.yaml
 
 ### Reward 函数设计
 
+两项相加，各自内部再分档（见 `scripts/train_grpo_search.py` 的
+`format_reward()` / `accuracy_reward()`）：
+
 ```
-Reward = 0.1 × Format(是否正确输出 THOUGHT/ACTION 格式)
-       + 0.3 × Contains(答案关键词是否在标准答案中出现)
-       + 0.6 × EM(完全匹配)
+Reward = Format + Accuracy
+
+Format  (封顶 1.0)
+    THOUGHT:            +0.3
+    ACTION:             +0.3
+    ANSWER:             +0.5
+
+Accuracy
+    EM (归一化后完全相等)     1.0
+    gold ⊂ pred             0.7
+    pred ⊂ gold             0.5
+    词重叠率                0.1 - 0.4
+```
 
 # 连续 reward 替代二值 0/1，组内 advantage 更平滑
-```
 
 ### Agent 推理引擎（LangGraph）
 
