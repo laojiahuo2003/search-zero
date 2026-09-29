@@ -56,6 +56,8 @@ _cfg = get_config()
 #   CREDIT_MODE=none|rule|llm         (default none -> vanilla GRPO)
 #   CREDIT_GAMMA=1.0                  softmax inverse temperature (>=10 hard)
 #   CREDIT_JUDGE_WORKERS=16           parallel LLM judge calls
+#   CREDIT_RULE_MIN_NEW_WORDS=3       rule judge novelty threshold
+#   CREDIT_RULE_QUERY_SIM=0.8         rule judge repeat-query Jaccard
 #   CREDIT_FALLBACK_UNIFORM=1         uniform weights when all credits are 0
 #   CREDIT_JUDGE_ONLY_POSITIVE_ADV=1  skip judging adv <= 0 trajectories
 CREDIT_CFG = get_credit_config()
@@ -961,7 +963,9 @@ def main():
                                     turns[idx]['credit'] = 0.0
                                     continue
                                 if CREDIT_CFG.mode == "rule":
-                                    ret, thk = rule_judge_turn(question, gt, turns, idx)
+                                    ret, thk = rule_judge_turn(
+                                        question, gt, turns, idx, CREDIT_CFG
+                                    )
                                     turns[idx]['credit'] = float(ret * thk)
                                     all_credit_ret.append(ret)
                                     all_credit_thk.append(thk)

@@ -69,41 +69,103 @@ class TestNormalizeContributions:
 
 
 class TestRuleJudge:
-    def test_new_gold_word_scores(self):
-        turns = make_turns(
-            ["district attorney Alice", "Alice Johnson career"],
-            ["The district attorney was a woman named Alice.",
-             "Johnson served from 1990 to 1998."],
-            "Alice Johnson",
-        )
-        assert rule_judge_turn("q", "Alice Johnson", turns, 0) == (1, 1)
-        assert rule_judge_turn("q", "Alice Johnson", turns, 1) == (1, 1)
+    """Negative-list design: only clearly useless turns score 0."""
 
-    def test_no_new_gold_word_scores_zero(self):
-        # Turn 1's observation adds no gold words -> retrieval 0 (the rule
-        # judge cannot see bridge entities; that is the LLM judge's job).
+    def test_bridge_entity_hop_scores(self):
+        # Multi-hop question: the first hop retrieves the BRIDGE entity's
+        # document, which contains no gold word — it must still score.
         turns = make_turns(
-            ["district attorney Alice", "Alice Johnson career"],
-            ["Alice Johnson was the DA.", "She served 1990-1998."],
+            ["Frank Herbert birthplace", "Dune author education"],
+            ["Frank Herbert was born in Tacoma Washington.",
+             "He attended the University of Washington."],
+            "University of Washington",
+        )
+        ret, thk = rule_judge_turn("Where did the Dune author study?",
+                                  "University of Washington", turns, 0)
+        assert ret == 1 and thk == 1
+
+    def test_no_new_information_scores_zero(self):
+        # Second obs is a near-duplicate of the first: nothing novel.
+        turns = make_turns(
+            ["Alice", "Alice"],
+            ["Alice Johnson was the district attorney.",
+             "Alice Johnson was the district attorney of X."],
             "Alice Johnson",
         )
         ret, thk = rule_judge_turn("q", "Alice Johnson", turns, 1)
         assert ret == 0
 
+    def test_no_result_marker_scores_zero(self):
+        turns = [
+            {'text': 't', 'query': 'zzzqqq', 'gen_ids': [1], 'credit': None,
+             'observation': 'OBSERVATION: No results found for "zzzqqq".'},
+            {'text': 't', 'query': '', 'gen_ids': [2], 'credit': None,
+             'observation': None},
+        ]
+        ret, thk = rule_judge_turn("q", "gold", turns, 0)
+        assert ret == 0
+
     def test_repeat_query_scores_thinking_zero(self):
         turns = make_turns(
-            ["Alice", "Alice"],
+            ["Alice Johnson", "Alice Johnson"],
             ["Alice was DA.", "Alice was DA."],
             "Alice",
         )
         ret, thk = rule_judge_turn("q", "Alice", turns, 1)
         assert thk == 0
 
+    def test_near_duplicate_query_scores_thinking_zero(self):
+        # 5/6 tokens identical -> Jaccard ~0.83 >= 0.8 default threshold.
+        turns = make_turns(
+            ["Alice Johnson attorney of X", "Alice Johnson attorney of X county"],
+            ["obs one has several words.", "obs two has several words."],
+            "Alice",
+        )
+        ret, thk = rule_judge_turn("q", "Alice", turns, 1)
+        assert thk == 0
+
+    def test_rephrased_query_not_penalized(self):
+        # Upstream judge: varying a failed query is a USEFUL attempt.
+        turns = make_turns(
+            ["Alice Johnson", "district attorney Alice"],
+            ["Alice Johnson was DA.", "She served 1990-1998."],
+            "Alice Johnson",
+        )
+        ret, thk = rule_judge_turn("q", "Alice Johnson", turns, 1)
+        assert thk == 1
+
     def test_empty_query_scores_thinking_zero(self):
-        turns = [{'query': '', 'observation': 'x', 'text': 't', 'gen_ids': [1]},
-                 {'query': '', 'observation': '', 'text': 't', 'gen_ids': [2]}]
+        turns = [{'query': '', 'observation': 'x y z w', 'text': 't',
+                  'gen_ids': [1], 'credit': None},
+                 {'query': '', 'observation': '', 'text': 't',
+                  'gen_ids': [2], 'credit': None}]
         ret, thk = rule_judge_turn("q", "gold", turns, 0)
         assert thk == 0
+
+    def test_gold_word_exempts_novelty_threshold(self):
+        # Only 4 novel words (< threshold 10), but one is a new gold word
+        # -> the exemption keeps the turn alive.
+        cfg = CreditConfig(mode='rule', gamma=1.0, fallback_uniform=True,
+                           rule_min_new_words=10)
+        turns = make_turns(
+            ["Alice Johnson"],
+            ["Alice was born here."],
+            "Alice Johnson",
+        )
+        ret, thk = rule_judge_turn("q", "Alice Johnson", turns, 0, cfg)
+        assert ret == 1
+
+    def test_threshold_configurable(self):
+        # Same turn, no gold word: fails the raised novelty threshold.
+        cfg = CreditConfig(mode='rule', gamma=1.0, fallback_uniform=True,
+                           rule_min_new_words=50)
+        turns = make_turns(
+            ["bridge entity"],
+            ["This document has only a handful of words."],
+            "some answer",
+        )
+        ret, thk = rule_judge_turn("q", "some answer", turns, 0, cfg)
+        assert ret == 0
 
 
 class TestBuildTokenAdvantages:

@@ -30,10 +30,18 @@ verl/trainer/ppo/core_algos.py, verl/workers/reward_manager/llm_judge.py):
                                      ANSWER turn keeps the original advantage
 
 Two judge backends, selectable via CREDIT_MODE:
-     "rule": deterministic, zero-cost. retrieval = gold-answer words that
-             appear in this turn's observation but not in any earlier one
-             (relevance + novelty). thinking = query non-empty and not a
-             verbatim repeat. A cheap proxy, not a substitute for the LLM.
+     "rule": deterministic, zero-cost. A NEGATIVE-LIST design: a turn is
+             worth zero only when it is clearly useless — the observation
+             brought no substantial new information (no-result responses,
+             near-duplicate retrieval), or the query is an empty/near
+             verbatim repeat. Everything else defaults to 1 and the
+             softmax normalization separates the rest. This deliberately
+             avoids the previous gold-anchor heuristic, which rewarded
+             only observations containing new gold-answer words and
+             systematically mis-scored bridge-entity hops in multi-hop
+             questions (HotpotQA's first hop rarely contains the answer
+             word). A gold word still EXEMPTS a turn from the novelty
+             threshold (strong positive signal, no false kill).
      "llm" : the upstream judge prompt adapted to the THOUGHT/ACTION/
              OBSERVATION format, called through the OpenAI-compatible API
              configured in .env (LLM_API_KEY / LLM_BASE_URL / LLM_MODEL).
@@ -42,6 +50,11 @@ Configuration (env vars, also settable in .env):
      CREDIT_MODE=none|rule|llm         (default: none -> vanilla GRPO)
      CREDIT_GAMMA=1.0                  softmax inverse temperature (>=10 hard)
      CREDIT_JUDGE_WORKERS=16           parallel LLM judge calls
+     CREDIT_RULE_MIN_NEW_WORDS=3       rule judge: min novel words for a
+                                       non-gold turn to count as informative
+     CREDIT_RULE_QUERY_SIM=0.8         rule judge: Jaccard similarity at or
+                                       above which a query counts as a
+                                       repeat (rephrases stay useful)
      CREDIT_FALLBACK_UNIFORM=1         uniform weights when all contributions
                                        are 0 (upstream's softmax path behaves
                                        this way; the hard path zeroes them)
@@ -106,6 +119,8 @@ class CreditConfig:
     mode: str = "none"                 # none | rule | llm
     gamma: float = 1.0                 # softmax inverse temperature
     judge_workers: int = 16            # parallel LLM judge calls
+    rule_min_new_words: int = 3        # rule judge novelty threshold
+    rule_query_sim_threshold: float = 0.8  # rule judge repeat-query Jaccard
     fallback_uniform: bool = True      # uniform weights when all credits are 0
     judge_only_positive_adv: bool = True  # skip judging adv <= 0 trajectories
 
@@ -130,6 +145,8 @@ def get_credit_config() -> CreditConfig:
         mode=mode,
         gamma=float(os.getenv("CREDIT_GAMMA", "1.0")),
         judge_workers=int(os.getenv("CREDIT_JUDGE_WORKERS", "16")),
+        rule_min_new_words=int(os.getenv("CREDIT_RULE_MIN_NEW_WORDS", "3")),
+        rule_query_sim_threshold=float(os.getenv("CREDIT_RULE_QUERY_SIM", "0.8")),
         fallback_uniform=_env_bool("CREDIT_FALLBACK_UNIFORM", True),
         judge_only_positive_adv=_env_bool("CREDIT_JUDGE_ONLY_POSITIVE_ADV", True),
     )
@@ -145,41 +162,81 @@ def _norm_tokens(text: str) -> set:
     return set(text.split())
 
 
-def rule_judge_turn(question: str, gt: str, turns: list, idx: int) -> tuple:
+# LocalWikiSearcher returns these fixed strings for failed lookups; they must
+# not be mistaken for informative content (their words would otherwise look
+# like "new tokens" the first time they appear).
+_NO_RESULT_MARKERS = ("no results found", "empty search query")
+
+
+def _query_similarity(a: str, b: str) -> float:
+    """Jaccard similarity over normalized token sets; identical -> 1.0.
+
+    Token-level, so a rephrased query (synonym swap / added word) lands well
+    below the repeat threshold — matching the upstream judge's stance that
+    varying a failed query is a useful retrieval attempt.
+    """
+    ta, tb = _norm_tokens(a), _norm_tokens(b)
+    if not ta or not tb:
+        return 1.0 if a.strip().lower() == b.strip().lower() else 0.0
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return inter / union if union else 0.0
+
+
+def rule_judge_turn(question, gt, turns, idx, cfg=None) -> tuple:
     """Deterministic stand-in for the LLM judge (CREDIT_MODE="rule").
 
-    Returns (retrieval_reward, thinking_reward) in {0, 1}.
+    NEGATIVE-LIST design — a turn scores 0 only when it is clearly useless,
+    and defaults to 1 otherwise (the softmax then separates the degrees).
+    This keeps false kills rare, because scoring a good hop as 0 re-zeros its
+    real contribution, which is worse than letting a mediocre hop keep 1.
 
-    retrieval: the gold answer's words appear in this turn's observation AND
-        at least one of them was NOT seen in any previous observation. This
-        is the rule-level approximation of the official judge's two criteria
-        (relevance + novelty). Bridge entities that do not share words with
-        the gold answer are invisible to this heuristic — a known limitation,
-        which is why the LLM judge exists.
+    retrieval = 0 when:
+        - no observation was produced, or it is a no-result/empty-query
+          response from LocalWikiSearcher;
+        - the observation brings fewer than cfg.rule_min_new_words novel
+          words relative to all previous observations (near-duplicate
+          retrieval). A NEW GOLD WORD exempts the turn from the threshold:
+          it is the strongest positive signal a rule can see, so even a
+          single novel gold word counts as informative.
 
-    thinking: the search query is non-empty and not a verbatim repeat of an
-        earlier query. The official thinking criterion (reasoning grounded in
-        retrieved docs) cannot be checked by rules, so this dimension is only
-        weakly guarded and effectively defaults to 1.
+    thinking = 0 when:
+        - the query is empty;
+        - the query is a near-verbatim repeat of an earlier query
+          (Jaccard >= cfg.rule_query_sim_threshold). Rephrases stay useful.
+
+    `question` is accepted for signature symmetry with the LLM judge but is
+    not used: rule-level query/evidence assessment is intentionally
+    conservative about what it can reliably know.
     """
+    cfg = cfg or CreditConfig()
     turn = turns[idx]
-    obs_tokens = _norm_tokens(turn.get("observation") or "")
+    obs = (turn.get("observation") or "").strip()
     query = (turn.get("query") or "").strip()
+    obs_tokens = _norm_tokens(obs)
 
-    prev_tokens = set()
-    for t in turns[:idx]:
-        prev_tokens |= _norm_tokens(t.get("observation") or "")
-    new_gold = _norm_tokens(gt) & (obs_tokens - prev_tokens)
-    retrieval = 1 if new_gold else 0
+    # ---- retrieval: substantial novel information (or a new gold word) ----
+    retrieval = 0
+    if obs and not any(m in obs.lower() for m in _NO_RESULT_MARKERS):
+        prev_tokens = set()
+        for t in turns[:idx]:
+            prev_tokens |= _norm_tokens(t.get("observation") or "")
+        new_tokens = obs_tokens - prev_tokens
+        gold_new = _norm_tokens(gt) & new_tokens
+        if len(new_tokens) >= cfg.rule_min_new_words or gold_new:
+            retrieval = 1
 
+    # ---- thinking: non-empty, non-repeat query ----
     thinking = 1
     if not query:
         thinking = 0
     else:
         for t in turns[:idx]:
-            if (t.get("query") or "").strip() == query:
+            prev_q = (t.get("query") or "").strip()
+            if prev_q and _query_similarity(query, prev_q) >= cfg.rule_query_sim_threshold:
                 thinking = 0
                 break
+
     return retrieval, thinking
 
 
