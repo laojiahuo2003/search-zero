@@ -215,20 +215,18 @@ uv run python scripts/train_grpo_search.py
 uv run python scripts/run_eval.py data/hotpotqa_dev.json 100
 #                                      ^数据源          ^条数，默认 8
 
-# 带真实 Wikipedia 搜索的评测（需要先起搜索服务）
+# 带搜索的评测：默认本地索引（与训练检索环境完全一致，确定性、无外网依赖）
 uv run python scripts/eval_with_real_wiki.py \
-  --checkpoint /path/to/grpo/checkpoint \
+  --checkpoint outputs/search_r1_grpo_search \
   --eval_data data/hotpotqa_eval_100.json \
-  --wiki_url http://127.0.0.1:18080/search \
   --output eval_results.json
 ```
 
-`--max_samples 0` 表示全量。搜索服务端：
+`--max_samples 0` 表示全量。
 
-```bash
-# 本地起 Wikipedia 搜索服务（默认端口 18080）
-uv run python scripts/wiki_search_server.py
-```
+> 本地模式用 `data/wiki_index.json`（训练同款 `LocalWikiSearcher`）。
+> 如需联网 Wikipedia，先起服务 `uv run python scripts/wiki_search_server.py`，
+> 再加 `--wiki_mode url --wiki_url http://127.0.0.1:18080/search`。
 
 ### 单次搜索推理
 

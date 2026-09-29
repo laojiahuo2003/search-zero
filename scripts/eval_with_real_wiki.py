@@ -1,8 +1,17 @@
 """
-Evaluation script — runs on cloud A100, connects to local Wikipedia proxy via SSH tunnel.
+Evaluation script — loads the GRPO LoRA checkpoint and evaluates on HotpotQA.
 
-Usage on cloud:
+Default search backend is the LOCAL wiki index (data/wiki_index.json) — the
+same deterministic backend used during training, no network needed.
+
+Usage:
     python eval_with_real_wiki.py \
+        --checkpoint outputs/search_r1_grpo_search \
+        --eval_data data/hotpotqa_eval_100.json \
+        --output eval_results.json
+
+For live Wikipedia instead (requires the HTTP proxy):
+    python eval_with_real_wiki.py --wiki_mode url \
         --checkpoint /data/outputs/search_r1_grpo_search/checkpoint-XXX \
         --eval_data /data/hotpotqa/eval.json \
         --wiki_url http://127.0.0.1:18080/search \
@@ -20,6 +29,9 @@ import requests
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wiki_search import LocalWikiSearcher
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.utils.config import get_config
@@ -69,8 +81,19 @@ def load_model(checkpoint_path: Optional[str] = None):
     return model, tokenizer
 
 
-def wiki_search(query: str, wiki_url: str, top_k: int = 3, sentences: int = 3) -> str:
-    """Call the local Wikipedia HTTP proxy."""
+def wiki_search(query: str, wiki_url: str, top_k: int = 3, sentences: int = 3,
+                local_searcher=None) -> str:
+    """Search via local index (training-consistent) or Wikipedia HTTP proxy.
+
+    Args:
+        query: search query string
+        wiki_url: HTTP proxy URL (used only when local_searcher is None)
+        local_searcher: LocalWikiSearcher instance; if given, search the local
+            index with the exact same backend used during training
+    """
+    if local_searcher is not None:
+        return local_searcher.search(query, top_k=top_k, sentences=sentences)
+
     try:
         r = requests.get(wiki_url, params={"q": query, "top_k": top_k, "sentences": sentences}, timeout=15)
         data = r.json()
@@ -86,8 +109,9 @@ def wiki_search(query: str, wiki_url: str, top_k: int = 3, sentences: int = 3) -
         return f"OBSERVATION: Search failed: {e}"
 
 
-def generate_answer(model, tokenizer, question: str, wiki_url: str) -> tuple:
-    """Multi-turn ReAct generation with real Wikipedia search."""
+def generate_answer(model, tokenizer, question: str, wiki_url: str,
+                    local_searcher=None) -> tuple:
+    """Multi-turn ReAct generation with search (local index or live Wikipedia)."""
     chat = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
@@ -126,7 +150,7 @@ def generate_answer(model, tokenizer, question: str, wiki_url: str) -> tuple:
         if search_match:
             query = search_match.group(1).strip()
             if query:
-                obs = wiki_search(query, wiki_url)
+                obs = wiki_search(query, wiki_url, local_searcher=local_searcher)
                 prompt_text += gen_text + "\n" + obs + "\n"
                 continue
 
@@ -158,6 +182,8 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None, help="LoRA checkpoint path")
     parser.add_argument("--eval_data", type=str, default=_cfg.hotpotqa_eval_path)
     parser.add_argument("--wiki_url", type=str, default="http://127.0.0.1:18080/search")
+    parser.add_argument("--wiki_mode", type=str, choices=["local", "url"], default="local",
+                        help="local = local index (same backend as training), url = HTTP wiki proxy")
     parser.add_argument("--output", type=str, default="eval_results.json")
     parser.add_argument("--max_samples", type=int, default=0, help="0 = all")
     args = parser.parse_args()
@@ -169,19 +195,30 @@ def main():
         eval_data = eval_data[:args.max_samples]
     print(f"Evaluating {len(eval_data)} samples...")
 
-    # Test wiki connection
-    print(f"Testing wiki proxy: {args.wiki_url}?q=test")
-    try:
-        r = requests.get(args.wiki_url, params={"q": "test", "top_k": 1, "sentences": 1}, timeout=10)
-        if r.status_code == 200:
-            print("  Wiki proxy OK")
-        else:
-            print(f"  WARNING: HTTP {r.status_code}")
-            print("  Start local server: python scripts/wiki_search_server.py")
-            print("  Then SSH tunnel: ssh -R 18080:127.0.0.1:18080 root@IP -p PORT")
-    except Exception as e:
-        print(f"  WARNING: Cannot reach wiki proxy: {e}")
-        print("  Make sure SSH tunnel is active.")
+    # Initialize search backend
+    local_searcher = None
+    if args.wiki_mode == "local":
+        index_path = _cfg.wiki_index_path
+        if not os.path.exists(index_path):
+            print(f"  FATAL: local wiki index not found: {index_path}")
+            print("  Build it first: python scripts/build_wiki_index.py")
+            sys.exit(1)
+        local_searcher = LocalWikiSearcher(index_path)
+        print(f"  Using LOCAL search: {local_searcher.get_stats()['articles']} articles")
+    else:
+        # Test wiki connection
+        print(f"Testing wiki proxy: {args.wiki_url}?q=test")
+        try:
+            r = requests.get(args.wiki_url, params={"q": "test", "top_k": 1, "sentences": 1}, timeout=10)
+            if r.status_code == 200:
+                print("  Wiki proxy OK")
+            else:
+                print(f"  WARNING: HTTP {r.status_code}")
+                print("  Start local server: python scripts/wiki_search_server.py")
+                print("  Then SSH tunnel: ssh -R 18080:127.0.0.1:18080 root@IP -p PORT")
+        except Exception as e:
+            print(f"  WARNING: Cannot reach wiki proxy: {e}")
+            print("  Make sure SSH tunnel is active.")
 
     # Load model
     model, tokenizer = load_model(args.checkpoint)
@@ -197,7 +234,8 @@ def main():
         gold_answer = item["answer"]
 
         print(f"\n[{i+1}/{len(eval_data)}] Q: {question[:100]}...")
-        pred_answer, turns = generate_answer(model, tokenizer, question, args.wiki_url)
+        pred_answer, turns = generate_answer(model, tokenizer, question, args.wiki_url,
+                                             local_searcher)
 
         em = exact_match(pred_answer, gold_answer)
         cm = contains_match(pred_answer, gold_answer)
