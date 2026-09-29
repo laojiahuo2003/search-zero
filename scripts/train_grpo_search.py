@@ -74,9 +74,11 @@ NUM_EPOCHS = 1
 # Samples per micro-batch. With BATCHED_GENERATION on, the P samples x G
 # completions are left-padded into ONE generate() call (P x G sequences);
 # the group-normalized advantage is still computed per sample. 500 samples /
-# (4 x 4) = 31 steps/epoch at ~95s/step => ~50 min/epoch.
-PER_DEVICE_BATCH_SIZE = 4
-GRADIENT_ACCUMULATION_STEPS = 4
+# (8 x 2) = 31 steps/epoch — SAME steps, samples/step, warmup and LR
+# schedule as (4 x 4), but each micro packs 16 sequences instead of 8, so
+# the launch-bound GPU amortises its fixed per-kernel overhead further.
+PER_DEVICE_BATCH_SIZE = 8
+GRADIENT_ACCUMULATION_STEPS = 2
 LEARNING_RATE = 5.0e-7
 WARMUP_RATIO = 0.1
 NUM_GENERATIONS = 2  # Reduced from 4 for faster training (2x speedup)
