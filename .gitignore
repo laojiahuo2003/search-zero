@@ -21,11 +21,16 @@ __pycache__/
 # Claude Code config
 .claude/
 
-# Data artifacts (generated)
-data/sft/
+# Data artifacts (generated). NOTE: data/sft/*.jsonl IS tracked on purpose
+# (commit b8c12b9 — the SFT trajectories ship with the repo so SFT can run
+# without re-generating them); only index/QA JSON under data/ is ignored.
 data/*.jsonl
 data/*.json
 *.tar.gz
+
+# Eval/test run artifacts
+test_results.json
+eval_results*.json
 
 # Artifacts produced outside the repo (SEARCH_ZERO_ROOT)
 models/
