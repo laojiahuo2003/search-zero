@@ -1,6 +1,16 @@
 """
 Evaluation script — loads the GRPO LoRA checkpoint and evaluates on HotpotQA.
 
+Training-consistency contract (IMPORTANT):
+  The rollout reuses the EXACT context construction of the GRPO training
+  loop (train_grpo_search_MI300X.py): GRPO_SYSTEM_PROMPT, make_prompt_ids()
+  for the initial prompt, tokenize_observation() to wrap each observation
+  as a user turn, and extract_answer() to read the final answer. Evaluating
+  with a different prompt/format would measure a different policy than the
+  one that was trained.
+
+  Decoding is greedy (do_sample=False) so results are reproducible.
+
 Default search backend is the LOCAL wiki index (data/wiki_index.json) — the
 same deterministic backend used during training, no network needed.
 
@@ -16,6 +26,8 @@ For live Wikipedia instead (requires the HTTP proxy):
         --eval_data /data/hotpotqa/eval.json \
         --wiki_url http://127.0.0.1:18080/search \
         --output eval_results.json
+
+On small GPUs (e.g. RTX 3080 10GB) add --load_in_4bit.
 """
 import argparse
 import json
@@ -32,6 +44,14 @@ from peft import PeftModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wiki_search import LocalWikiSearcher
+# Training-side context construction — single source of truth for the
+# prompt/observation format. Do NOT re-implement these locally.
+from train_grpo_search_MI300X import (
+    GRPO_SYSTEM_PROMPT,
+    make_prompt_ids,
+    tokenize_observation,
+    extract_answer,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.utils.config import get_config
@@ -42,40 +62,41 @@ _cfg = get_config()
 # Config
 # ============================================================
 MODEL_PATH = _cfg.base_model
-MAX_TURNS = 3
+MAX_TURNS = 3            # must match training (train_grpo_search_MI300X)
 MAX_TOKENS_PER_TURN = 256
-TEMPERATURE = 0.7  # Lower temp for eval (greedy-ish)
-
-SYSTEM_PROMPT = """You are a helpful assistant that answers questions by searching Wikipedia.
-
-Always follow this format:
-THOUGHT: <your reasoning>
-ACTION: SEARCH: <search query>
-or
-ACTION: ANSWER: <final answer>
-
-When you have enough information, output ACTION: ANSWER: with the answer."""
 
 
-def load_model(checkpoint_path: Optional[str] = None):
-    """Load base model + optional LoRA checkpoint."""
+def load_model(checkpoint_path: Optional[str] = None, load_in_4bit: bool = False):
+    """Load base model + optional LoRA checkpoint.
+
+    load_in_4bit quantises the base via bitsandbytes so a 7B model fits a
+    ~10GB GPU; the adapter is then kept UNMERGED (merging is unreliable on
+    4-bit weights).
+    """
     print(f"Loading base model from {MODEL_PATH}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
+    model_kwargs = dict(
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
+    if load_in_4bit:
+        from transformers import BitsAndBytesConfig
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, **model_kwargs)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"Loading LoRA from {checkpoint_path}...")
         model = PeftModel.from_pretrained(model, checkpoint_path)
-        model = model.merge_and_unload()
-        print("  LoRA loaded and merged.")
+        if load_in_4bit:
+            print("  LoRA loaded (unmerged — 4-bit base).")
+        else:
+            model = model.merge_and_unload()
+            print("  LoRA loaded and merged.")
 
     model.eval()
     return model, tokenizer
@@ -111,47 +132,53 @@ def wiki_search(query: str, wiki_url: str, top_k: int = 3, sentences: int = 3,
 
 def generate_answer(model, tokenizer, question: str, wiki_url: str,
                     local_searcher=None) -> tuple:
-    """Multi-turn ReAct generation with search (local index or live Wikipedia)."""
-    chat = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
-    prompt_text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+    """Multi-turn ReAct generation with search (local index or live Wikipedia).
 
+    Mirrors the training rollout (generate_with_search) one-to-one:
+    same prompt, same observation wrapping, same turn structure — only the
+    decoding differs (greedy here, sampled during training).
+    """
+    current_ids = make_prompt_ids(tokenizer, GRPO_SYSTEM_PROMPT, question)
     all_turns = []
-    for turn in range(MAX_TURNS):
-        inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
-        if inputs["input_ids"].shape[1] > 2048:
-            inputs["input_ids"] = inputs["input_ids"][:, -2048:]
+
+    for _ in range(MAX_TURNS):
+        # Same guard as training: cap the context so a long observation
+        # cannot push the sequence past the truncation limit.
+        if len(current_ids) > 2048:
+            current_ids = current_ids[-2048:]
+        input_tensor = torch.tensor([current_ids], device=model.device)
 
         with torch.no_grad():
             outputs = model.generate(
-                inputs["input_ids"],
+                input_tensor,
                 max_new_tokens=MAX_TOKENS_PER_TURN,
-                temperature=TEMPERATURE,
-                do_sample=True,
-                top_p=0.9,
+                do_sample=False,  # greedy: reproducible eval
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
 
-        gen_ids = outputs[0, inputs["input_ids"].shape[1]:]
-        gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        gen_ids = outputs[0, input_tensor.shape[1]:].tolist()
+        if not gen_ids:
+            break
+        gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
         all_turns.append(gen_text)
 
-        # Check for ANSWER
-        answer_match = re.search(r'ACTION\s*:\s*ANSWER\s*:\s*(.+?)$', gen_text, re.IGNORECASE | re.DOTALL | re.MULTILINE)
-        if answer_match:
-            return answer_match.group(1).strip(), all_turns
+        # ANSWER ends the trajectory (same regex family as training).
+        if re.search(r'ACTION\s*:\s*ANSWER\s*:', gen_text, re.IGNORECASE):
+            answer = extract_answer(gen_text)
+            return (answer if answer else gen_text.strip()), all_turns
 
-        # Check for SEARCH
-        search_match = re.search(r'ACTION\s*:\s*SEARCH\s*:\s*(.+?)(?:\n\s*(?:ACTION|THOUGHT|$)|$)',
-                                 gen_text, re.IGNORECASE | re.DOTALL)
+        # SEARCH appends the observation wrapped as a user turn — the exact
+        # token structure the model saw during training.
+        search_match = re.search(
+            r'ACTION\s*:\s*SEARCH\s*:\s*(.+?)(?:\n\s*(?:ACTION|THOUGHT|$)|$)',
+            gen_text, re.IGNORECASE | re.DOTALL)
         if search_match:
             query = search_match.group(1).strip()
             if query:
                 obs = wiki_search(query, wiki_url, local_searcher=local_searcher)
-                prompt_text += gen_text + "\n" + obs + "\n"
+                obs_ids = tokenize_observation(tokenizer, obs)
+                current_ids = current_ids + gen_ids + obs_ids
                 continue
 
         break  # No action found, stop
@@ -169,12 +196,18 @@ def normalize_answer(text: str) -> str:
 
 
 def exact_match(pred: str, gold: str) -> bool:
-    return normalize_answer(pred) == normalize_answer(gold)
+    n_pred, n_gold = normalize_answer(pred), normalize_answer(gold)
+    if not n_gold:
+        return False
+    return n_pred == n_gold
 
 
 def contains_match(pred: str, gold: str) -> bool:
     """Check if gold answer is contained in prediction."""
-    return normalize_answer(gold) in normalize_answer(pred)
+    n_pred, n_gold = normalize_answer(pred), normalize_answer(gold)
+    if not n_gold or not n_pred:
+        return False
+    return n_gold in n_pred
 
 
 def main():
@@ -184,6 +217,8 @@ def main():
     parser.add_argument("--wiki_url", type=str, default="http://127.0.0.1:18080/search")
     parser.add_argument("--wiki_mode", type=str, choices=["local", "url"], default="local",
                         help="local = local index (same backend as training), url = HTTP wiki proxy")
+    parser.add_argument("--load_in_4bit", action="store_true",
+                        help="quantise base model to 4-bit (small GPUs); adapter stays unmerged")
     parser.add_argument("--output", type=str, default="eval_results.json")
     parser.add_argument("--max_samples", type=int, default=0, help="0 = all")
     args = parser.parse_args()
@@ -221,7 +256,7 @@ def main():
             print("  Make sure SSH tunnel is active.")
 
     # Load model
-    model, tokenizer = load_model(args.checkpoint)
+    model, tokenizer = load_model(args.checkpoint, load_in_4bit=args.load_in_4bit)
 
     # Evaluate
     results = []
@@ -273,6 +308,8 @@ def main():
         "em_accuracy": em_correct / total if total > 0 else 0,
         "contains_accuracy": contains_correct / total if total > 0 else 0,
         "checkpoint": args.checkpoint,
+        "decoding": "greedy",
+        "prompt_format": "training-consistent (GRPO_SYSTEM_PROMPT + tokenize_observation)",
         "results": results,
     }
     with open(args.output, "w", encoding="utf-8") as f:
