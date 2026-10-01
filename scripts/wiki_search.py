@@ -209,9 +209,13 @@ class LocalWikiSearcher:
         with open(index_path, 'r', encoding='utf-8') as f:
             self.articles = json.load(f)
 
-        # Build search structures
+        # Build search structures. Word sets are precomputed ONCE here —
+        # the per-query loop used to re-split every article's full text on
+        # every search call (O(corpus) per query). Scoring is unchanged.
         self._titles = [a["title"].lower() for a in self.articles]
         self._full_texts = [a.get("full_text", "").lower() for a in self.articles]
+        self._title_word_sets = [set(t.split()) for t in self._titles]
+        self._text_word_sets = [set(t.split()) for t in self._full_texts]
         self._cache: dict[str, str] = {}
 
         print(f"[LocalWiki] Loaded {len(self.articles)} articles from {index_path}")
@@ -239,15 +243,14 @@ class LocalWikiSearcher:
             self._cache[query] = result
             return result
 
-        # Score each article by word overlap
+        # Score each article by word overlap (precomputed word sets)
         scores = []
-        for i, (title, full_text) in enumerate(zip(self._titles, self._full_texts)):
+        for i, (title, title_words, text_words) in enumerate(
+                zip(self._titles, self._title_word_sets, self._text_word_sets)):
             # Title match bonus
-            title_words = set(title.split())
             title_overlap = len(query_words & title_words)
 
             # Content word overlap
-            text_words = set(full_text.split())
             text_overlap = len(query_words & text_words)
 
             # Also check if query is a substring of title or text
