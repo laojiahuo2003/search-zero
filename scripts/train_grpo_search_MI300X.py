@@ -8,6 +8,9 @@ Key design decisions:
     This keeps token IDs deterministic between generation and loss computation.
   - Incremental forward passes for both old and new logprobs → perfect alignment.
   - Wikipedia search with disk cache to minimize API latency.
+  - NUM_INNER_UPDATES (mu) PPO-style inner updates per rollout batch with
+    frozen old_logprobs: mu=1 reproduces the original REINFORCE-equivalent
+    behaviour (ratio == 1, clip never engages); mu>1 makes the clip real.
 
 Usage (on A100):
   /data/miniconda/envs/torch/bin/python scripts/train_grpo_search.py
@@ -92,6 +95,19 @@ MAX_COMPLETION_TOKENS = 3072  # 3 turns × 256 + obs overhead
 SAVE_STEPS = 500
 LOG_STEPS = 1
 NUM_SAMPLES = 500
+
+# Inner policy updates per rollout batch (PPO-style epochs over the collected
+# data, old_logprobs frozen). mu=1 reproduces the historical behaviour
+# exactly: old and new logprobs come from the same parameters, ratio == 1,
+# the clip never engages (advantage-weighted REINFORCE). With mu>1 the
+# rollout data (turns / old_logprobs / advantages / credits) is collected
+# ONCE per step and Phase 3 runs mu times over it; from the 2nd inner pass
+# the parameters have moved, ratio deviates from 1 and the asymmetric clip
+# (epsilon_low/high) actually constrains the update. Generation — the
+# expensive phase — still happens only once; each extra pass costs one
+# packed-logprob + backward sweep over the step's completions.
+# Env-overridable for A/B runs: GRPO_INNER_UPDATES=3 uv run python ...
+NUM_INNER_UPDATES = int(os.environ.get("GRPO_INNER_UPDATES", "1"))
 
 # Pack ALL sequences of one micro-batch (PER_DEVICE_BATCH_SIZE samples x
 # NUM_GENERATIONS completions) into a single batched generate() call.
@@ -659,34 +675,6 @@ def _packed_turn_logprob_forward(model, batch):
     return row_results
 
 
-def compute_all_logprobs(model, turns, compute_old=False):
-    """Compute per-token logprobs for all turns (with grad if model is trainable).
-
-    Uses the exact same input_ids and gen_ids as generation.
-    Returns concatenated logprobs for all model-generated tokens.
-
-    Args:
-        compute_old: if True, also return old_logprobs from turns (no grad)
-    """
-    all_lps = []
-    all_old_lps = []
-
-    for turn in turns:
-        lps = compute_turn_logprobs(model, turn['input_ids'], turn['gen_ids'])
-        all_lps.append(lps)
-
-        if compute_old and 'old_logprobs' in turn:
-            all_old_lps.append(turn['old_logprobs'].to(model.device))
-
-    new_lps = torch.cat(all_lps) if all_lps else torch.tensor([], device=model.device)
-
-    if compute_old:
-        old_lps = torch.cat(all_old_lps) if all_old_lps else torch.tensor([], device=model.device)
-        return new_lps, old_lps
-
-    return new_lps
-
-
 def compute_batch_logprobs(model, all_turns_list):
     """Batch compute logprobs for multiple completions to reduce forward passes.
 
@@ -764,6 +752,115 @@ def grpo_loss(per_token_logps, old_per_token_logps, advantages,
         per_token_loss = per_token_loss + beta * per_token_kl
 
     return per_token_loss.mean()
+
+
+def run_phase3_updates(model, optimizer, trainable_params, step_data,
+                       total_completions, num_inner_updates, credit_cfg,
+                       beta, epsilon_low, epsilon_high, lr):
+    """Phase 3: consume one step's collected rollout data with
+    `num_inner_updates` optimizer steps (PPO-style inner loop).
+
+    The rollout data (turns / frozen old_logprobs / advantages / credits) is
+    collected ONCE per step by Phases 1-2.5; this function replays it
+    `num_inner_updates` times. Inner pass 1 is on-policy w.r.t. the frozen
+    old_logprobs (ratio == 1, mu=1 reproduces the historical behaviour
+    exactly); from pass 2 on, the parameters have moved, ratio deviates
+    from 1 and the asymmetric clip actually constrains the update.
+
+    Each inner pass accumulates gradients over ALL micro-batches (each
+    completion's loss is divided by total_completions, so a pass's gradient
+    is the average over the step's completions), then clips, applies the
+    shared scheduled LR and steps the optimizer.
+
+    Args:
+        step_data: list over micro-batches; each element is a list over
+            samples of {'turns': group_turns, 'advantages': (G,) tensor}
+        total_completions: completions generated in this step (all micros);
+            the per-completion loss divisor (see main loop comment)
+        num_inner_updates: mu, number of optimizer steps over the same data
+        lr: scheduled learning rate applied to every inner pass of this step
+
+    Returns:
+        (mean_batch_loss, stats): mean_batch_loss averages the per-pass
+            batch loss over inner passes (identical to the old value when
+            mu=1); stats holds off-policy diagnostics averaged over inner
+            passes 2..mu ('ratio_dev' = mean |ratio - 1|, 'clip_frac' =
+            fraction of clipped tokens); both 0.0 when mu == 1.
+    """
+    total_loss = 0.0
+    ratio_devs, clip_fracs = [], []
+
+    for u in range(num_inner_updates):
+        optimizer.zero_grad()
+        for micro_samples in step_data:
+            for sample in micro_samples:
+                group_turns = sample['turns']
+                advantages = sample['advantages']
+
+                # Batch compute all logprobs at once (reduces forward passes)
+                batch_logprobs = compute_batch_logprobs(model, group_turns)
+
+                # Sum the group's per-completion losses and backward ONCE.
+                # The packed forward shares ONE autograd graph across all
+                # completions of the group, so per-completion sequential
+                # backward() would re-traverse freed saved tensors
+                # (RuntimeError: backward through the graph a second time).
+                # Summing first is mathematically identical (gradients add)
+                # and the peak memory is the same: the shared activations
+                # are alive until the last backward either way.
+                sample_loss = None
+                for g in range(len(group_turns)):
+                    new_lps, old_lps = batch_logprobs[g]
+
+                    if len(new_lps) == 0 or len(old_lps) == 0:
+                        continue
+
+                    if credit_cfg.mode != "none":
+                        # CW-GRPO: reallocate the trajectory advantage across
+                        # turns. Token order matches the concatenated
+                        # per-turn logprobs in new_lps.
+                        adv = build_token_advantages(
+                            group_turns[g], float(advantages[g]), credit_cfg
+                        ).to(model.device)
+                    else:
+                        adv = advantages[g]
+                    loss = grpo_loss(new_lps, old_lps, adv,
+                                     beta=beta, epsilon_low=epsilon_low,
+                                     epsilon_high=epsilon_high)
+                    # Divide by the completions in the WHOLE step (all
+                    # micros) so a pass's gradient is the average over
+                    # its completions, invariant to PER_DEVICE_BATCH_SIZE
+                    # and GRADIENT_ACCUMULATION_STEPS.
+                    loss = loss / total_completions
+                    sample_loss = loss if sample_loss is None else sample_loss + loss
+
+                    total_loss += loss.item() * total_completions
+
+                    if u > 0:
+                        # Off-policy diagnostics: only inner passes 2..mu can
+                        # deviate from the frozen old_logprobs (pass 1 is
+                        # on-policy by construction).
+                        with torch.no_grad():
+                            ratio = torch.exp(new_lps - old_lps)
+                            ratio_devs.append((ratio - 1).abs().mean().item())
+                            clip_fracs.append(
+                                ((ratio < 1 - epsilon_low) |
+                                 (ratio > 1 + epsilon_high)
+                                 ).float().mean().item())
+
+                if sample_loss is not None:
+                    sample_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
+        optimizer.step()
+
+    stats = {
+        'ratio_dev': sum(ratio_devs) / len(ratio_devs) if ratio_devs else 0.0,
+        'clip_frac': sum(clip_fracs) / len(clip_fracs) if clip_fracs else 0.0,
+    }
+    return total_loss / num_inner_updates, stats
 
 
 # ============================================================
@@ -910,6 +1007,7 @@ def main():
 
     print(f"  Steps: {total_steps}, Warmup: {warmup_steps}")
     print(f"  Batch: {PER_DEVICE_BATCH_SIZE} × {GRADIENT_ACCUMULATION_STEPS}")
+    print(f"  Inner updates per step (mu): {NUM_INNER_UPDATES}")
 
     # ============================================================
     # Training Loop
@@ -929,6 +1027,7 @@ def main():
             "beta": BETA,
             "epsilon_low": EPSILON_LOW,
             "epsilon_high": EPSILON_HIGH,
+            "num_inner_updates": NUM_INNER_UPDATES,
             "max_turns": MAX_TURNS,
             "max_completion_tokens": MAX_COMPLETION_TOKENS,
             "num_samples": NUM_SAMPLES,
@@ -961,8 +1060,6 @@ def main():
         step_size = PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
 
         for batch_start in range(0, len(dataset), step_size):
-            optimizer.zero_grad()
-            batch_loss = 0.0
             all_rewards, all_fmt, all_acc, all_lengths = [], [], [], []
             all_credit_ret, all_credit_thk = [], []  # judge stats for CW-GRPO
             n_micro = 0
@@ -972,6 +1069,10 @@ def main():
             # PER_DEVICE_BATCH_SIZE / GRADIENT_ACCUMULATION_STEPS and to a
             # ragged tail micro-batch.
             total_completions = 0
+            # Rollout data collected by Phases 1/2/2.5, consumed by Phase 3
+            # (NUM_INNER_UPDATES times, with frozen old_logprobs).
+            # Layout: step_data[micro][sample] = {'turns', 'advantages'}
+            step_data = []
 
             for micro in range(GRADIENT_ACCUMULATION_STEPS):
                 sample_start = batch_start + micro * PER_DEVICE_BATCH_SIZE
@@ -1049,10 +1150,12 @@ def main():
                           f"{time.time() - t0_gen:.2f}s "
                           f"turns={[len(t) for ts in micro_turns for t in ts]}")
 
-                # Phases 2/2.5/3 run per sample (group normalization is
-                # per-sample by definition). Timers accumulate across samples
-                # and are printed once per micro.
-                t_reward_acc = t_credit_acc = t_logprob_acc = t_loss_acc = 0.0
+                # Phases 2/2.5 run per sample during collection (group
+                # normalization is per-sample by definition); Phase 3 runs
+                # after ALL micros are collected, NUM_INNER_UPDATES times.
+                # Timers accumulate across samples, printed once per micro.
+                t_reward_acc = t_credit_acc = 0.0
+                micro_data = []
                 for s in range(n_samples):
                     group_turns = micro_turns[s]
                     group_texts = micro_texts[s]
@@ -1136,60 +1239,36 @@ def main():
                                 all_credit_thk.append(thk)
                         t_credit_acc += time.time() - t0_credit
 
-                    # ============================================================
-                    # Phase 3: LEARNING — Batch compute GRPO loss with new_logprobs
-                    # ============================================================
-                    # Batch compute all logprobs at once (reduces forward passes)
-                    t0_logprob = time.time()
-                    batch_logprobs = compute_batch_logprobs(model, group_turns)
-                    t_logprob_acc += time.time() - t0_logprob
+                    # Stash for Phase 3 (runs after all micros, mu times)
+                    micro_data.append({'turns': group_turns,
+                                       'advantages': advantages})
 
-                    t0_loss = time.time()
-                    for g in range(NUM_GENERATIONS):
-                        new_lps, old_lps = batch_logprobs[g]
-
-                        if len(new_lps) == 0 or len(old_lps) == 0:
-                            continue
-
-                        if CREDIT_CFG.mode != "none":
-                            # CW-GRPO: reallocate the trajectory advantage across
-                            # turns. Token order matches the concatenated
-                            # per-turn logprobs in new_lps.
-                            adv = build_token_advantages(
-                                group_turns[g], float(advantages[g]), CREDIT_CFG
-                            ).to(model.device)
-                        else:
-                            adv = advantages[g]
-                        loss = grpo_loss(new_lps, old_lps, adv,
-                                         beta=BETA, epsilon_low=EPSILON_LOW,
-                                         epsilon_high=EPSILON_HIGH)
-                        # Divide by the completions in the WHOLE step (all
-                        # micros) so a step's gradient is the average over
-                        # its completions, invariant to PER_DEVICE_BATCH_SIZE
-                        # and GRADIENT_ACCUMULATION_STEPS.
-                        loss = loss / total_completions
-                        loss.backward()
-
-                        batch_loss += loss.item() * total_completions
-
-                    t_loss_acc += time.time() - t0_loss
-
+                step_data.append(micro_data)
                 if global_step <= 2:
                     print(f"  Reward computation: {t_reward_acc:.2f}s")
                     if CREDIT_CFG.mode != "none":
                         print(f"  Credit assignment: {t_credit_acc:.2f}s")
-                    print(f"  Logprobs computation: {t_logprob_acc:.2f}s")
-                    print(f"  Loss & backward: {t_loss_acc:.2f}s")
 
             if n_micro == 0:
                 break
 
-            # Gradient step — set LR before stepping so the schedule does not lag one step
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            for pg in optimizer.param_groups:
-                pg['lr'] = get_lr(global_step)
-            optimizer.step()
-            current_lr = optimizer.param_groups[0]['lr']
+            # ============================================================
+            # Phase 3: LEARNING — mu inner updates over the frozen rollout
+            # ============================================================
+            # old_logprobs stay frozen from Phase 1, so inner pass 2+ sees
+            # ratio != 1 and the clip does real work. All inner passes of a
+            # data-step share the same scheduled LR, so mu=1 reproduces the
+            # historical behaviour exactly (same backward order, same loss
+            # scaling, same LR schedule).
+            t0_phase3 = time.time()
+            current_lr = get_lr(global_step)
+            batch_loss, update_stats = run_phase3_updates(
+                model, optimizer, trainable_params, step_data,
+                total_completions, NUM_INNER_UPDATES, CREDIT_CFG,
+                BETA, EPSILON_LOW, EPSILON_HIGH, current_lr)
+            if global_step <= 2:
+                print(f"  Phase 3 (mu={NUM_INNER_UPDATES}): "
+                      f"{time.time() - t0_phase3:.2f}s")
 
             global_step += 1
 
@@ -1208,13 +1287,23 @@ def main():
                 if all_credit_ret:
                     metrics["credit_retrieval_mean"] = sum(all_credit_ret) / len(all_credit_ret)
                     metrics["credit_thinking_mean"] = sum(all_credit_thk) / len(all_credit_thk)
+                # Off-policy diagnostics of the inner loop (mu>1 only):
+                # ratio_dev grows as inner passes drift from the frozen
+                # old_logprobs; clip_frac > 0 is direct evidence the
+                # asymmetric clip is now constraining updates.
+                if NUM_INNER_UPDATES > 1:
+                    metrics["ratio_dev"] = update_stats['ratio_dev']
+                    metrics["clip_frac"] = update_stats['clip_frac']
+                inner_info = (f" rdev={update_stats['ratio_dev']:.4f}"
+                              f" clip={update_stats['clip_frac']:.3f}"
+                              if NUM_INNER_UPDATES > 1 else "")
                 print(f"[Step {global_step}/{total_steps}] "
                       f"loss={batch_loss:.4f} "
                       f"rew={sum(all_rewards)/n:.3f} "
                       f"fmt={sum(all_fmt)/n:.3f} "
                       f"acc={sum(all_acc)/n:.3f} "
                       f"len={sum(all_lengths)/n:.0f} "
-                      f"lr={current_lr:.2e}")
+                      f"lr={current_lr:.2e}" + inner_info)
                 log_metrics(swanlab_run, metrics, step=global_step)
 
             # Checkpoint
