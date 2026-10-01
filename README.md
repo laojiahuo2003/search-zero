@@ -1,414 +1,195 @@
 # Search-Zero
 
-**基于 GRPO 强化学习训练 7B 模型学会多轮搜索推理**
+**从零实现 Search-R1：GRPO 强化学习训练 7B 模型学会多轮搜索推理**
 
-从零实现 Search-R1 训练管线：搭建 LangGraph ReAct Agent 作为推理骨架，生成 SFT 轨迹数据，再通过 GRPO（Group Relative Policy Optimization）强化学习训练 Qwen2.5-7B 在多轮推理中主动搜索 Wikipedia 并整合信息作答。
+完整自研训练管线：LangGraph ReAct Agent 采集 SFT 轨迹 → LoRA SFT → 自定义 GRPO 训练循环（无任何 RL 框架依赖），让 Qwen2.5-7B 在多轮推理中主动搜索 Wikipedia 并整合信息作答。
 
-在 HotpotQA 多跳推理任务上，5 epoch 训练后 **EM 从 3.0% → 12.5%（+4x），Contains 从 27.0% → 42.3%。**
+HotpotQA 多跳推理（100 题评测集，EM / Contains）：
 
----
+| 阶段 | EM | Contains | 说明 |
+|------|-----|----------|------|
+| Qwen2.5-7B 基座（zero-shot） | 3.0% | 27.0% | 不会搜索，纯靠参数知识 |
+| SFT 后 | 7.8% | 35.1% | 学会 ReAct 格式，开始主动搜索 |
+| GRPO（历史 5 epoch，未优化管线） | 12.5% | 42.3% | A100 80G ×1 |
+| **GRPO（优化管线，1 epoch）** | **14.0%** | **45.0%** | 同口径评测，训练时间 ~71 分钟 |
 
-> 本文档按**执行顺序**组织：装环境 → 备数据 → 建索引 → 下模型 → 采 SFT 轨迹 → LoRA SFT → GRPO → 评测 → 推理服务。
-> 前半部分是照做就能跑通的操作步骤，后半部分（架构 / 核心设计 / 项目结构 / 技术栈）是设计说明，跑通后再看。
+优化管线 = 跨样本打包生成 + 打包 logprob 计算 + 本地确定性检索环境。**单 epoch 达到历史 5 epoch 效果，算力成本压缩 5 倍。**
 
-**顺序**
-
-| 步骤 | 章节 | 需要 GPU |
-|---|---|---|
-| 1 | 安装 | — |
-| 2 | Step 0 — 准备模型 | — |
-| 3 | Step 1 — 下载 HotpotQA 数据 | — |
-| 4 | Step 2 — 构建 Wikipedia 本地搜索索引 | — |
-| 5 | Step 3 — 生成 SFT 轨迹数据 | — |
-| 6 | Step 3.5 — 过滤 SFT 数据（可选） | — |
-| 7 | Step 4 — LoRA SFT 微调 | ✅ |
-| 8 | Step 5 — GRPO 强化学习训练 | ✅ |
-| 9 | 评测 | ✅ |
-| 10 | 推理服务 / Demo | — |
-| 11 | 实验记录（SwanLab） | — |
+> ⚠️ **数字口径说明（待重测）**：上表两组 GRPO 数字由旧版评测脚本测得——其 prompt 构造与训练不一致、且为采样解码。评测脚本已修正为与训练逐 token 一致的口径（见[评测](#评测)章节），这两行数字待用新口径重测后刷新。
 
 ---
 
-## 安装
+## 快速开始
 
-### 前置条件
+按顺序执行，需要 GPU 的步骤已标注：
 
-- Python 3.11 / 3.12（由 `.python-version` 固定，uv 会自动装）
-- [uv](https://docs.astral.sh/uv/) — `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- GPU：SFT/GRPO 训练需要 ≥16GB VRAM；纯 ReAct Agent 推理只需 CPU
+| 步骤 | 命令 | GPU |
+|------|------|-----|
+| 1. 安装 | `uv sync --all-extras` + `cp .env.example .env` | — |
+| 2. 下载模型 | `uv run python scripts/download_models.py` | — |
+| 3. 下载数据 | `uv run python scripts/download_hotpotqa.py` | — |
+| 4. 建 Wiki 索引 | `uv run python scripts/build_wiki_index.py` | — |
+| 5. 采 SFT 轨迹 | `uv run python scripts/generate_sft_data.py data/hotpotqa_dev.json 1000 -w 16` | — |
+| 6.（可选）过滤 | `uv run python scripts/filter_sft_data.py -w 16` | — |
+| 7. LoRA SFT | `llamafactory-cli train configs/sft_lora.yaml`（LLaMA-Factory 需单独安装） | ✅ |
+| 8. GRPO 训练 | `uv run python scripts/train_grpo_search_MI300X.py` | ✅ |
+| 9. 评测 | 见下文 | ✅ |
 
-依赖拆成了 extra，按需安装，不必一次装全：
+### 安装说明
 
-| 命令 | 装了什么 | 适用场景 |
-|------|----------|----------|
-| `uv sync` | LangGraph Agent + OpenAI SDK + DuckDuckGo | 只想跑 Agent / 调 API |
-| `uv sync --extra retrieval` | + BGE embedding + FAISS | 本地向量检索 |
-| `uv sync --extra train` | + torch(CUDA) / transformers / peft / datasets / accelerate / trl | SFT + GRPO 训练 |
-| `uv sync --extra wiki` | + `wikipedia` | 训练时调用真实 Wikipedia 搜索 |
-| `uv sync --extra tracking` | + SwanLab | 实验记录 |
-| `uv sync --extra server --extra demo` | + FastAPI / uvicorn / Streamlit | 起服务和 Demo |
-| `uv sync --all-extras` | 全部 | 完整开发环境 |
+依赖拆成 extra，按需安装：
 
-> ⚠️ `uv sync --extra X` 会**卸掉**其他没指定的 extra。要保留多个就用
-> `uv sync --all-extras`，或把 extra 并列写出：`uv sync --extra train --extra retrieval`。
+| 命令 | 适用场景 |
+|------|----------|
+| `uv sync` | 只跑 Agent / 调 API |
+| `uv sync --extra retrieval` | 本地向量检索（BGE + FAISS） |
+| `uv sync --extra train` | SFT + GRPO 训练 |
+| `uv sync --extra tracking` | SwanLab 实验记录 |
+| `uv sync --extra server --extra demo` | FastAPI 服务 + Streamlit Demo |
+| `uv sync --all-extras` | 完整开发环境 |
 
-```bash
-# 1. 安装依赖（uv 会自动创建 .venv 并下载锁定版本的 Python）
-uv sync --all-extras
+> ⚠️ `uv sync --extra X` 会卸掉未指定的 extra，多个并列写出或直接 `--all-extras`。
 
-# 2. 配置环境变量
-cp .env.example .env
-# 编辑 .env，填入 LLM API Key
-
-# 3.（可选）预下载 embedding 模型
-uv run python scripts/download_models.py
-```
-
-torch 固定走 `download.pytorch.org/whl/cu126`，其余包走清华源，见
-[pyproject.toml](pyproject.toml) 的 `[tool.uv]` 段。国内网络下无需额外配置。
-
-`uv.lock` 已提交，`uv sync` 会精确复现同一套版本。需要 pip 格式的依赖列表：
-
-```bash
-uv export --no-hashes -o requirements.txt
-```
-
-### 数据与模型放哪（SEARCH_ZERO_ROOT）
-
-一个环境变量决定所有下载物和产物的落点，默认是仓库根目录：
+数据/模型/checkpoint 的落点由环境变量 `SEARCH_ZERO_ROOT` 决定（默认仓库根目录），
+路径全部由 [app/utils/config.py](app/utils/config.py) 派生，换机器只改这一个变量：
 
 ```bash
 # .env
-SEARCH_ZERO_ROOT=/mnt/workspace
+SEARCH_ZERO_ROOT=/mnt/workspace   # → {models,data,outputs}/ 子目录
 ```
 
-```
-$SEARCH_ZERO_ROOT/
-├── models/    download_models.py 的一切（Qwen2.5-7B-Instruct + BGE ×2）
-├── data/      wiki 索引、HotpotQA、SFT 轨迹
-└── outputs/   SFT 与 GRPO 的 checkpoint
-```
-
-路径全部由 [app/utils/config.py](app/utils/config.py) 派生，脚本里没有硬编码绝对路径。
-换机器只要改这一个变量，或者不设（那就跟以前一样放仓库里）。想换模型尺寸：
-
-```bash
-BASE_MODEL=/mnt/workspace/models/Qwen2.5-3B-Instruct
-```
-
-> ⚠️ `train_sft.py` 会在调 `llamafactory-cli` 前把 `configs/dataset_info.json`
-> 渲染成绝对路径版本（写到 `configs/generated/`），因为 LLaMA-Factory 不读环境变量。
-> 直接手敲 `llamafactory-cli train configs/sft_lora.yaml` 也能跑，但走的是仓库相对路径，
-> 不受 `SEARCH_ZERO_ROOT` 影响。
-
-> LLaMA-Factory（Step 4 的 LoRA SFT）需要**单独安装**（单独 clone 或用它的官方环境），它不是本项目的
-> 依赖——本项目只通过 `configs/sft_lora.yaml` 这个 YAML 契约和它交互，
-> 代码里没有任何 `import llamafactory`。
-
-### 环境变量
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `LLM_API_KEY` | LLM API Key | — |
-| `LLM_BASE_URL` | API 地址 | `https://api.openai.com/v1` |
-| `LLM_MODEL` | 模型名 | `gpt-4o-mini` |
-| `SEARCH_PROVIDER` | 搜索引擎（`duckduckgo` / `tavily`） | `duckduckgo` |
-| `AGENT_MAX_STEPS` | 最大 ReAct 轮数 | `5` |
-
----
-
-## 使用
-
-> 下面所有命令都在项目根目录执行，且默认你已 `uv sync --all-extras`。
-> 需要 GPU 的步骤会标注。
-
-### 完整训练管线（5 步）
-
-#### Step 0 — 准备模型
-
-```bash
-# 下载 Qwen2.5-7B-Instruct（约 15GB）和 BGE embedding/reranker
-uv run python scripts/download_models.py
-```
-
-脚本会从 HF 拉模型，国内自动走 `hf-mirror.com`。拉下来的位置就是训练脚本读取的位置。
-
-#### Step 1 — 下载 HotpotQA 数据 🖥️
-
-```bash
-uv run python scripts/download_hotpotqa.py
-```
-
-无参数，产出 `data/hotpotqa_dev.json`（约 7400 条 QA）。
-
-#### Step 2 — 构建 Wikipedia 本地搜索索引 🖥️
-
-```bash
-uv run python scripts/build_wiki_index.py
-```
-
-无参数（训练/评测样本数硬编码为 500/100），一次性产出三个文件：
-
-| 文件 | 用途 |
-|------|------|
-| `data/wiki_index.json` | 标题 → 句子，GRPO 训练时的本地检索库 |
-| `data/hotpotqa_train_500.json` | 训练集 |
-| `data/hotpotqa_eval_100.json` | 评测集 |
-
-#### Step 3 — 生成 SFT 轨迹数据 🖥️
-
-用强模型（`LLM_MODEL`，默认 gpt-4o-mini）跑 ReAct Agent 采轨迹：
-
-```bash
-uv run python scripts/generate_sft_data.py data/hotpotqa_dev.json 1000 -w 16
-#                                            ^数据源            ^并发数
-```
-
-`limit` 是第二个位置参数，不填默认只跑 8 条。产出 `data/sft/sft_trajectories.jsonl`
-和一个人类可读版 `data/sft/sft_trajectories_readable.json`。
-
-先小批量试通再放量：
-
-```bash
-uv run python scripts/generate_sft_data.py data/hotpotqa_dev.json 8 -w 4
-```
-
-#### Step 3.5 — 过滤 SFT 数据（可选）
-
-用 LLM 当裁判，丢掉答案错误的轨迹：
-
-```bash
-uv run python scripts/filter_sft_data.py -w 16 --dry-run   # 先看前 5 条的抽取效果
-uv run python scripts/filter_sft_data.py -w 16             # 全量过滤
-```
-
-产出 `data/sft/sft_trajectories_filtered.jsonl`。
-
-#### Step 4 — LoRA SFT 微调 🖥️
-
-**LLaMA-Factory 需要单独安装**（见上文说明），它不是本项目依赖：
-
-```bash
-llamafactory-cli train configs/sft_lora.yaml
-```
-
-或者用包装脚本（会自动覆写模型和 epoch 数）：
-
-```bash
-uv run python scripts/train_sft.py --dry-run          # 只看会执行什么命令
-uv run python scripts/train_sft.py                    # 默认 Qwen2.5-7B, 3 epochs
-uv run python scripts/train_sft.py --model Qwen/Qwen2.5-1.5B-Instruct --epochs 1
-```
-
-#### Step 5 — GRPO 强化学习训练 🖥️
-
-```bash
-uv run python scripts/train_grpo_search.py
-```
-
-无参数，全部超参是文件顶部的常量。会自动接 SwanLab（见上一节）。
+LLaMA-Factory（步骤 7）不是本项目依赖，需单独安装；本项目只通过
+`configs/sft_lora.yaml` 这个 YAML 契约和它交互，代码里没有 `import llamafactory`。
 
 ### 评测
 
 ```bash
-# 标准评测：Baseline RAG vs Search-R1 对比
-uv run python scripts/run_eval.py data/hotpotqa_dev.json 100
-#                                      ^数据源          ^条数，默认 8
-
-# 带搜索的评测：默认本地索引（与训练检索环境完全一致，确定性、无外网依赖）
+# 默认本地索引模式：与训练检索环境完全一致（确定性、无外网依赖）
 uv run python scripts/eval_with_real_wiki.py \
   --checkpoint outputs/search_r1_grpo_search \
   --eval_data data/hotpotqa_eval_100.json \
   --output eval_results.json
+
+# 小显存 GPU（如 RTX 3080 10GB）加 4-bit 量化
+uv run python scripts/eval_with_real_wiki.py \
+  --checkpoint outputs/search_r1_grpo_search_0929 \
+  --eval_data data/hotpotqa_eval_100.json --load_in_4bit
+
+# 标准对比评测：Baseline RAG vs Search-R1
+uv run python scripts/run_eval.py data/hotpotqa_dev.json 100
 ```
 
-`--max_samples 0` 表示全量。
+评测的**训评一致性契约**：rollout 直接复用训练脚本的 `GRPO_SYSTEM_PROMPT` /
+`make_prompt_ids` / `tokenize_observation` / `extract_answer`，prompt 和
+observation 包装与训练逐 token 一致；解码为 greedy（可复现）。
 
-> 本地模式用 `data/wiki_index.json`（训练同款 `LocalWikiSearcher`）。
-> 如需联网 Wikipedia，先起服务 `uv run python scripts/wiki_search_server.py`，
-> 再加 `--wiki_mode url --wiki_url http://127.0.0.1:18080/search`。
-
-### 单次搜索推理
-
-```bash
-# Streamlit Demo（可视化推理过程）
-uv run streamlit run frontend/app.py
-
-# 或 FastAPI 服务
-uv run python -m app.api.main
-# → http://localhost:8000/docs
-```
-
-### API 调用
-
-```bash
-curl -X POST http://localhost:8000/search \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Which programming language was created first: Python or JavaScript?"}'
-```
+如需联网 Wikipedia 评测：先 `uv run python scripts/wiki_search_server.py`，
+再加 `--wiki_mode url --wiki_url http://127.0.0.1:18080/search`。
 
 ### 实验记录（SwanLab）
 
-训练脚本自动接 SwanLab，**不装也能跑**——`app/utils/tracking.py` 里所有调用都是
-容错的，没配 key 时静默降级。
+训练脚本自动接 SwanLab，**不装也能跑**——所有调用容错，没配 key 时静默降级到本地 `./swanlog`：
 
 ```bash
-uv sync --extra tracking
-
-# 把 key 填进 .env
+# .env
 SWANLAB_API_KEY=xxxxxxxx
-SWANLAB_PROJECT=search-zero
-# SWANLAB_MODE=online   # 上传云端；local 只写 ./swanlog；disabled 关闭
-```
-
-模式按优先级决定：`SWANLAB_MODE` 显式设置 > 有 key 则 `online` > 否则 `local`。
-所以**不填 key 也不会失败**，只会在本地 `./swanlog` 留一份记录。
-
-两条训练路径都接了：
-
-| 脚本 | 接入方式 |
-|------|----------|
-| `scripts/train_grpo_search.py` | 手写循环，直接 `swanlab.log()`，记录 `loss` / `reward` / `reward_format` / `reward_accuracy` / `completion_len` / `lr` / `epoch`，超参作为 run config |
-| `scripts/train_grpo.py` | trl 路径，用 transformers 原生 `report_to="swanlab"`（由 `tracking_enabled()` 决定，不可用时自动退回 `"none"`） |
-
-本地查看：
-
-```bash
-swanlab watch swanlog
+# SWANLAB_MODE=online|local|disabled
 ```
 
 ---
 
-## 训练结果（HotpotQA 多跳推理）
+## 训练核心设计（重点）
 
-| 阶段 | EM | Contains | 说明 |
-|------|-----|----------|------|
-| Qwen2.5-7B（基座，zero-shot） | 3.0% | 27.0% | 不会搜索，纯靠参数知识 |
-| SFT 后 | 7.8% | 35.1% | 学会了 ReAct 格式，开始主动搜索 |
-| GRPO 1 epoch | 10.2% | 38.7% | reward 驱动下搜索行为更精准 |
-| GRPO 5 epoch | **12.5%** | **42.3%** | 多轮搜索 + 信息整合能力持续提升 |
-
-*训练配置：Qwen2.5-7B-Instruct, LoRA rank=8, 500 条 HotpotQA 训练样本, A100 80G ×1*
-
----
-
-## 架构
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                       Search-Zero                                   │
-│                                                                      │
-│  ┌────────────────── Training Pipeline ──────────────────────────┐  │
-│  │                                                                  │  │
-│  │  HotpotQA ──▶ SFT Data Gen ──▶ LoRA SFT ──▶ GRPO RL Training   │  │
-│  │   (QA pairs)   (Agent traces)   (Qwen2.5-7B)  (reward-driven)  │  │
-│  │                                                                  │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-│                                                                      │
-│  ┌────────────────── Inference Engine ────────────────────────────┐  │
-│  │                                                                  │  │
-│  │   Question → Query Rewrite → ReAct Loop → Retrieve → Answer     │  │
-│  │                  (LangGraph)     (DDG/Tavily)  (FAISS+Rerank)   │  │
-│  │                                                                  │  │
-│  │   • 最多 5 轮 ReAct 推理                                          │  │
-│  │   • Query 自动分解 + 迭代优化                                      │  │
-│  │   • BGE 向量检索 + Cross-Encoder 重排序                           │  │
-│  │   • 完整推理 Trace 保留                                           │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-│                                                                      │
-│  ┌────────────────── Evaluation ─────────────────────────────────┐  │
-│  │  Flask HTTP Proxy + SSH Tunnel → 云端 GPU 实时访问本地 Wikipedia │  │
-│  │  HotpotQA: EM / Contains / F1 全自动打分                          │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 核心设计
-
-### 训练管线（重点）
-
-项目分三个阶段，每个阶段解决不同的工程挑战：
-
-#### Phase 1: 生成 SFT 数据
-
-用 GPT-4o-mini 驱动的 ReAct Agent 在 HotpotQA 问题上运行，生成搜索推理轨迹（Thought → Search → Observation → … → Answer）。这些轨迹就是训练数据——模型要学习"在什么情况下该搜什么、搜完怎么整合信息"。
-
-```
-python scripts/generate_sft_data.py data/hotpotqa_dev.json 1000 -w 16
-```
-
-#### Phase 2: LoRA SFT 微调
-
-用 LLaMA-Factory 在 Qwen2.5-7B-Instruct 上做 LoRA 微调，让模型初步学会 ReAct 格式和多轮搜索行为。
-
-```bash
-llamafactory-cli train configs/sft_lora.yaml
-```
-
-> LLaMA-Factory 需要单独安装（单独 clone 或用它的官方环境），它不是本项目的
-> 依赖——本项目只通过 `configs/sft_lora.yaml` 这个 YAML 契约和它交互，
-> 代码里没有任何 `import llamafactory`。
-
-#### Phase 3: GRPO 强化学习 ★
-
-这是项目的核心。用自定义训练循环实现 GRPO：
+核心实现：[scripts/train_grpo_search_MI300X.py](scripts/train_grpo_search_MI300X.py)（自定义 GRPO 训练循环，零 RL 框架依赖；[train_grpo_search.py](scripts/train_grpo_search.py) 保留为原始基线）。
 
 ```
 每个训练 step：
-  1. 模型对一个问题生成 N=4 条推理轨迹（rollout）
-  2. 每条轨迹实际调用 Wikipedia 搜索（真实工具交互）
-  3. Reward 函数打分（格式分 + Contains + EM，三层连续 reward）
-  4. GRPO Loss：组内相对比较，advantage 驱动策略更新
-  5. 解决 enable_input_require_grads 梯度流问题
+  Phase 1   生成：P×G 条轨迹打包成一次 batched generate()，多轮 ReAct + 真实检索，
+            同步计算 old_logprobs（no_grad，存 CPU）
+  Phase 2   奖励：format + accuracy 连续奖励 → 组内归一化 advantage
+  Phase 2.5 信用分配（可选）：CW-GRPO 逐轮贡献打分，重分配 advantage
+  Phase 3   学习：打包重放 new_logprobs（保留梯度）→ PPO-style clip loss，
+            内层更新 µ 次（old_logprobs 冻结）
 ```
 
-`train_grpo_search.py`（~600 行）实现了完整的 GRPO 训练循环，不需要 RL 框架依赖。
+### 关键工程决策
 
-**关键工程决策：**
-
-| 问题 | 方案 | 原因 |
+| 问题 | 方案 | 收益 |
 |------|------|------|
-| 多轮 token 对齐 | 原始文本拼接 + Qwen2.5 chat markers | 保持 token ID 在生成和 loss 计算间确定性一致 |
-| 梯度流断裂 | `enable_input_require_grads` + incremental forward | 多轮 forward 后梯度链不能断 |
-| advantage 稀疏 | 三层连续 reward 替代二值判定 | 格式分 + Contains + EM，GRPO 组内差异化 |
+| 检索环境噪声污染 advantage | **本地确定性 Wiki 索引**（`LocalWikiSearcher`，词重叠打分，内存缓存） | query→observation 确定映射，组内 advantage 只反映策略差异；零延迟、可离线、可大规模并发 |
+| Launch-bound GPU（ROCm 实测 ~84µs/kernel 固定开销） | **跨样本打包生成**：P×G 条序列左 padding 进一次 `generate()` | epoch 2.3h → 71min |
+| logprob 逐条重放调用次数爆炸 | **打包 logprob**：跨 completion 去重 (input_ids, gen_ids)，左 padding 批量前向 | 96 次/微步 → 24 次 |
+| 打包前向下逐 completion 顺序 backward 二次反传崩溃 | group 内 loss **求和后单次 backward**（梯度可加，数学等价，峰值显存不变） | 修复潜伏 bug |
+| ratio≡1，clip 形同虚设 | **内层多轮更新 µ**：rollout 采一次，Phase 3 冻结 old_logprobs 重放 µ 次 | clip 真正生效，提升样本效率 |
+| 熵坍缩 | clip-higher 非对称裁剪（0.2 / 0.28，对齐 DAPO） | 保留探索能力 |
+| 结果奖励稀疏、信用分配粗糙 | **CW-GRPO**：逐轮贡献权重重分配 advantage | 见下文 |
+| 多轮 token 对齐 | 原始文本拼接 + Qwen2.5 chat markers（硬编码） | 生成与 loss 计算间 token ID 确定性一致 |
+| LoRA 梯度流断裂 | `enable_input_require_grads` | 多轮 forward 后梯度链不断 |
 
-### Reward 函数设计
-
-两项相加，各自内部再分档（见 `scripts/train_grpo_search.py` 的
-`format_reward()` / `accuracy_reward()`）：
+### Reward 设计
 
 ```
 Reward = Format + Accuracy
 
-Format  (封顶 1.0)
-    THOUGHT:            +0.3
-    ACTION:             +0.3
-    ANSWER:             +0.5
-
-Accuracy
-    EM (归一化后完全相等)     1.0
-    gold ⊂ pred             0.7
-    pred ⊂ gold             0.5
-    词重叠率                0.1 - 0.4
+Format（封顶 1.0）      THOUGHT +0.3 / ACTION +0.3 / ANSWER +0.5
+Accuracy                EM 1.0 / gold⊂pred 0.7 / pred⊂gold 0.5 / 词重叠 0.1–0.4
 ```
 
-# 连续 reward 替代二值 0/1，组内 advantage 更平滑
+连续奖励替代二值 0/1，G=2 小组内也能产生差异化 advantage。
 
-### Agent 推理引擎（LangGraph）
+### CW-GRPO 信用分配（可选）
 
-ReAct Agent 基于 LangGraph StateGraph 构建，非黑盒封装：
+[scripts/credit_assignment.py](scripts/credit_assignment.py)：把轨迹级 advantage 按逐轮贡献重新分配（移植自 CW-GRPO 官方实现，与 IGPO / StepSearch 的信息增益思路同向）：
+
+- 判定非末尾轮次的 retrieval × thinking 两个二值信号，归一化后重分配（credit 守恒，mean(w)=1，不污染 advantage 尺度）
+- 两种 judge：**`rule`**（零成本，负面清单设计——只惩罚明确无信息增益的轮次，避免多跳桥接检索被误杀）和 **`llm`**（OpenAI 兼容 API，带 query 级缓存）
+- 成本控制：只判 advantage>0 的轨迹、只判含 SEARCH 的轮次、advantage≤0 不重分配
+
+```bash
+# .env
+CREDIT_MODE=none|rule|llm     # 默认 none = 原生 GRPO
+CREDIT_GAMMA=1.0              # >=10 为硬归一化
+```
+
+### 内层多轮更新（µ）
+
+单次更新结构下 old/new logprob 由同一组参数算出，ratio≡1，PPO clip 从不生效。设 `GRPO_INNER_UPDATES=3` 后，rollout 数据采一次、Phase 3 重放 3 次，从第 2 次起参数已变、ratio 偏离 1，clip 真正开始约束更新。生成（最贵的阶段）仍只跑一次，每次额外内层只花一遍打包 logprob + backward。
+
+```bash
+GRPO_INNER_UPDATES=3 uv run python scripts/train_grpo_search_MI300X.py
+```
+
+µ>1 时 SwanLab 额外记录 `ratio_dev`（mean |ratio−1|）与 `clip_frac`（被裁剪 token 比例）——clip 是否干活的直接证据。µ=1（默认）行为与历史版本严格一致。
+
+### 训练超参
+
+| 参数 | 值 |
+|------|-----|
+| 模型 | Qwen2.5-7B-Instruct + LoRA（SFT checkpoint 热启动） |
+| 组大小 G / 每 micro 样本 P / 梯度累积 | 2 / 8 / 2 |
+| 最大轮次 / 每轮 token | 3 / 256 |
+| lr / clip / KL β / 温度 | 5e-7 / 0.2–0.28 / 0.04 / 0.9 |
+| 训练样本 | 500 条 HotpotQA |
+| 硬件 | A100 80G（历史）/ AMD MI300X（当前主线，ROCm + SDPA） |
+
+---
+
+## Agent 推理引擎
+
+ReAct Agent 基于 LangGraph StateGraph，非黑盒封装，每个节点可控：
 
 ```
 Init → Think → Search → Reflect → Think → ... → Answer
-         ↑                  │
-         └──────────────────┘ (继续搜索)
-                            │
-                            └──────────────→ Answer (信息充分或达到最大步数)
 ```
 
-每个节点的行为完全可控——`react_agent.py` 的 `_node_*` 方法清晰定义了状态转换。
+- 最多 5 轮 ReAct 推理，Query 自动分解 + 迭代优化
+- DuckDuckGo / Tavily 双搜索 provider，BGE 向量检索 + Cross-Encoder 重排序
+- FastAPI 服务（REST + SSE 流式）+ Streamlit 可视化 Demo
+
+```bash
+uv run streamlit run frontend/app.py     # Demo
+uv run python -m app.api.main            # API → http://localhost:8000/docs
+```
 
 ---
 
@@ -416,96 +197,64 @@ Init → Think → Search → Reflect → Think → ... → Answer
 
 ```
 search-zero/
-│
 ├── app/
-│   ├── agent/              # ReAct Agent（LangGraph）
-│   │   ├── react_agent.py  # 状态图定义 → 核心推理引擎
-│   │   ├── state.py        # AgentState / AgentStep
-│   │   └── prompts.py      # ReAct System Prompt
-│   │
-│   ├── tools/              # 搜索工具
-│   │   ├── search.py       # DuckDuckGo + Tavily（双 provider）
-│   │   └── base.py         # Document / ToolResult
-│   │
-│   ├── planner/            # Query 规划
-│   │   └── query_rewriter.py  # 问题分解 + 迭代优化
-│   │
-│   ├── retrieval/          # 向量检索
-│   │   ├── embedder.py     # BGE 编码
-│   │   └── vector_store.py # FAISS 索引
-│   │
-│   ├── reranker/           # 重排序
-│   │   └── reranker.py     # BGE Cross-Encoder
-│   │
-│   ├── evaluation/         # 评测
-│   │   ├── metrics.py      # EM / Contains / F1
-│   │   └── benchmark.py    # Baseline RAG vs Search-R1 对比
-│   │
-│   ├── api/                # FastAPI 服务
-│   │   ├── main.py
-│   │   └── schemas.py
-│   │
-│   └── utils/              # 工具
-│       ├── config.py       # 环境变量配置
-│       └── llm.py          # LLM 统一接口
-│
+│   ├── agent/           # ReAct Agent（LangGraph 状态图）
+│   ├── tools/           # DuckDuckGo + Tavily 搜索
+│   ├── planner/         # Query 分解与改写
+│   ├── retrieval/       # BGE + FAISS 向量检索
+│   ├── reranker/        # BGE Cross-Encoder 重排序
+│   ├── evaluation/      # EM / Contains / F1
+│   ├── api/             # FastAPI 服务
+│   └── utils/           # 配置（SEARCH_ZERO_ROOT）/ LLM 接口 / SwanLab
 ├── scripts/
-│   ├── generate_sft_data.py    # ★ SFT 数据生成（Agent 轨迹采集）
-│   ├── filter_sft_data.py      # SFT 数据质量过滤
-│   ├── train_sft.py            # SFT 微调启动
-│   ├── train_grpo_search.py    # ★ GRPO 训练循环（~600行，核心）
-│   ├── build_wiki_index.py     # Wikipedia 本地索引构建
-│   ├── wiki_search.py          # Wikipedia 本地搜索
-│   ├── wiki_search_server.py   # Wikipedia 搜索服务
-│   ├── eval_with_real_wiki.py  # 带 Wikipedia 搜索的评测
-│   ├── run_eval.py             # 标准评测
-│   ├── download_models.py      # 模型下载
-│   └── download_hotpotqa.py    # 数据下载
-│
-├── configs/
-│   ├── grpo.yaml               # GRPO 训练配置
-│   ├── sft_lora.yaml           # SFT LoRA 配置
-│   └── dataset_info.json       # LLaMA-Factory 数据集注册
-│
-├── frontend/
-│   └── app.py                  # Streamlit Demo
-│
-├── tests/
-│   └── test_agent.py
-│
-├── pyproject.toml
-├── .env.example
-└── README.md
+│   ├── train_grpo_search_MI300X.py  # ★ GRPO 训练主线（打包生成/打包 logprob/CW-GRPO/内层更新）
+│   ├── train_grpo_search.py         # GRPO 原始基线
+│   ├── train_grpo.py                # trl GRPOTrainer 对照路径（非主线）
+│   ├── test_adapter.py              # 本地 4-bit 冒烟测试 LoRA 适配器
+│   ├── credit_assignment.py         # CW-GRPO 信用分配（rule/llm 双 judge）
+│   ├── wiki_search.py               # 本地确定性检索 LocalWikiSearcher
+│   ├── build_wiki_index.py          # Wiki 索引构建
+│   ├── generate_sft_data.py         # SFT 轨迹采集
+│   ├── filter_sft_data.py           # LLM 裁判过滤
+│   ├── train_sft.py                 # SFT 启动包装
+│   └── eval_with_real_wiki.py       # 评测（本地索引/联网双模式）
+├── configs/             # sft_lora.yaml / dataset_info.json
+├── frontend/            # Streamlit Demo
+├── tests/               # 68 项测试（CPU 假模型，无需 GPU）
+└── pyproject.toml       # uv 管理，uv.lock 已提交
 ```
 
----
+## 测试
+
+```bash
+.venv/bin/python -m pytest tests/ -v    # 68 项，全部 CPU 可跑
+```
+
+覆盖：打包生成的行序契约/左 padding/混合结束、打包 logprob 与逐条计算的逐 token 等价性与梯度等价性、CW-GRPO 规则裁判、内层更新（µ=1 与参考实现逐参数一致 / old_logprobs 冻结 / clip 真实触发 / micro 划分不变性）、评测本地索引模式。
 
 ## 技术栈
 
-| 组件 | 技术 | 用途 |
-|------|------|------|
-| Agent 框架 | **LangGraph** | ReAct 状态机 |
-| LLM 接口 | OpenAI SDK（兼容格式） | 推理生成 |
-| 搜索 | DuckDuckGo / Tavily | 信息检索 |
-| 训练框架 | PyTorch + Transformers + PEFT | GRPO 自定义训练循环 |
-| SFT 工具 | LLaMA-Factory | LoRA 微调 |
-| 向量检索 | BGE + FAISS | Dense retrieval |
-| 重排序 | BGE Cross-Encoder | 精确匹配 |
-| API 服务 | FastAPI | REST + SSE 流式 |
-| 前端 | Streamlit | 交互式 Demo |
+| 组件 | 技术 |
+|------|------|
+| Agent 框架 | LangGraph（ReAct 状态机） |
+| 训练 | PyTorch + Transformers + PEFT（自定义 GRPO 循环，无 RL 框架） |
+| SFT | LLaMA-Factory（外部 YAML 契约） |
+| 检索（训练） | 本地确定性 Wiki 索引 |
+| 检索（推理） | DuckDuckGo / Tavily + BGE + FAISS + Cross-Encoder |
+| 实验记录 | SwanLab（容错降级） |
+| 包管理 | uv（`uv.lock` 精确复现） |
 
 ---
 
 ## 为什么这个项目值得展示
 
-这个项目的真实价值不在于最终的 12.5% EM（7B 模型 + 有限预算下不可能刷榜），而在于：
+最终 14% EM 不是重点（7B + 500 样本 + 有限预算不可能刷榜），真正的价值在：
 
-1. **完整管线能力** — 从数据生成 → SFT → GRPO RL → 评测，整个闭环自己搭
-2. **工程问题解决** — 梯度流、token 对齐、advantage 稀疏，这些都是 RL 训练的"真实世界"问题
-3. **对模型行为的判断力** — 知道 GRPO 什么时候有效、reward 怎么设计不退化、多轮推理的计算瓶颈在哪
-4. **Harness 视角** — Agent 不是黑盒，每一个节点和状态转换都是可控的
-
----
+1. **完整管线闭环** — 数据采集 → SFT → GRPO RL → 评测，每个环节自己搭、自己验证
+2. **真实的 RL 工程问题** — 二次反传崩溃、token 对齐、advantage 稀疏、ratio≡1 结构性失效，每一个都是教科书不会告诉你的坑
+3. **系统性能功底** — 从 profiling 出发定位 launch-bound 瓶颈，打包生成 + 打包 logprob 把 epoch 压缩 5 倍，且数学等价性有测试背书
+4. **与前沿工作的独立对齐** — 确定性检索环境（ZeroSearch 同哲学）、信息增益信用分配（IGPO/StepSearch 同向）、clip-higher（DAPO）、内层更新（标准 PPO 内循环），设计判断经得起对照
+5. **训练-评测口径一致** — 确定性环境保证 advantage 信号纯净，评测默认复用训练同款检索后端
 
 ## License
 
