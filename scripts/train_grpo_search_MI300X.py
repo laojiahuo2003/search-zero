@@ -95,8 +95,11 @@ PER_DEVICE_BATCH_SIZE = 16
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 5.0e-7
 WARMUP_RATIO = 0.1
-NUM_GENERATIONS = 4  # G=2 collapses the group-normalized advantage to a
-# sign-only +/-0.707; G>=4 restores magnitude information.
+NUM_GENERATIONS = 2  # G=2 trades advantage magnitude for memory: ~64GB vs
+# G=4's ~128GB. The group-normalized advantage collapses to sign-only +/-0.707
+# (torch.std's unbiased n-1 estimator makes the two deviations equal/opposite),
+# losing magnitude information. Use G>=4 when memory allows; G=2 is the
+# memory-constrained fallback.
 TEMPERATURE = 0.9
 BETA = 0.04
 EPSILON_LOW = 0.2
