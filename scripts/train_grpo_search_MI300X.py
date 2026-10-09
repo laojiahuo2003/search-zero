@@ -73,18 +73,30 @@ OUTPUT_DIR = _cfg.grpo_output_dir
 WIKI_CACHE_DIR = _cfg.wiki_cache_dir
 HOTPOTQA_PATH = _cfg.hotpotqa_train_path
 
-NUM_EPOCHS = 1
+NUM_EPOCHS = 2
 # Samples per micro-batch. With BATCHED_GENERATION on, the P samples x G
 # completions are left-padded into ONE generate() call (P x G sequences);
-# the group-normalized advantage is still computed per sample. 500 samples /
-# (8 x 2) = 31 steps/epoch — SAME steps, samples/step, warmup and LR
-# schedule as (4 x 4), but each micro packs 16 sequences instead of 8, so
-# the launch-bound GPU amortises its fixed per-kernel overhead further.
-PER_DEVICE_BATCH_SIZE = 8
-GRADIENT_ACCUMULATION_STEPS = 2
+# the group-normalized advantage is still computed per sample.
+#
+# Sizing on this MI300X (launch-bound: GFX-Uti 100% / Mem-Uti 8%, ~84us per
+# kernel, ~700 launches per forward):
+#   * P drives speed. An epoch issues (MAX_TURNS x NUM_SAMPLES / P) generate()
+#     calls and a call's cost is nearly row-independent while launch-bound, so
+#     wall-clock ~ 1/P. P=16 with G=4 packs 64 rows (~11GB of KV cache) — 4x
+#     the launch amortisation of the previous P=8 x G=2.
+#   * GA trades update count for gradient noise and cancels out of the
+#     generation cost (fewer steps, more micros per step). GA=1 keeps
+#     M = P = 16 -> 31 steps/epoch; GA=4 would halve that to 15.
+#   * Phase 3 peak VRAM does NOT grow with GA or P: backward() runs per
+#     sample, so only one group's autograd graph is alive at a time. It does
+#     grow with G — one group is G x MAX_TURNS turn rows, packed at
+#     max_batch_rows=4 and all alive until that sample's backward.
+PER_DEVICE_BATCH_SIZE = 16
+GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 5.0e-7
 WARMUP_RATIO = 0.1
-NUM_GENERATIONS = 2  # Reduced from 4 for faster training (2x speedup)
+NUM_GENERATIONS = 4  # G=2 collapses the group-normalized advantage to a
+# sign-only +/-0.707; G>=4 restores magnitude information.
 TEMPERATURE = 0.9
 BETA = 0.04
 EPSILON_LOW = 0.2
@@ -97,17 +109,19 @@ LOG_STEPS = 1
 NUM_SAMPLES = 500
 
 # Inner policy updates per rollout batch (PPO-style epochs over the collected
-# data, old_logprobs frozen). mu=1 reproduces the historical behaviour
-# exactly: old and new logprobs come from the same parameters, ratio == 1,
-# the clip never engages (advantage-weighted REINFORCE). With mu>1 the
-# rollout data (turns / old_logprobs / advantages / credits) is collected
-# ONCE per step and Phase 3 runs mu times over it; from the 2nd inner pass
-# the parameters have moved, ratio deviates from 1 and the asymmetric clip
-# (epsilon_low/high) actually constrains the update. Generation — the
-# expensive phase — still happens only once; each extra pass costs one
-# packed-logprob + backward sweep over the step's completions.
-# Env-overridable for A/B runs: GRPO_INNER_UPDATES=3 uv run python ...
-NUM_INNER_UPDATES = int(os.environ.get("GRPO_INNER_UPDATES", "1"))
+# data, old_logprobs frozen). mu=1 is pure on-policy REINFORCE: old and new
+# logprobs come from the same parameters, ratio == 1, so the clip never
+# engages and the KL term is exactly zero. With mu>1 the rollout data
+# (turns / old_logprobs / advantages / credits) is collected ONCE per step
+# and Phase 3 runs mu times over it; from the 2nd inner pass the parameters
+# have moved, ratio deviates from 1 and the asymmetric clip
+# (epsilon_low/high) plus the KL penalty actually constrain the update.
+# Generation — the expensive phase — still happens only once; each extra pass
+# costs one packed-logprob + backward sweep over the step's completions.
+# mu does NOT raise peak VRAM: the inner passes are sequential, so pass u's
+# autograd graphs are freed before pass u+1 starts.
+# Env-overridable for A/B runs: GRPO_INNER_UPDATES=1 uv run python ...
+NUM_INNER_UPDATES = int(os.environ.get("GRPO_INNER_UPDATES", "2"))
 
 # Pack ALL sequences of one micro-batch (PER_DEVICE_BATCH_SIZE samples x
 # NUM_GENERATIONS completions) into a single batched generate() call.
