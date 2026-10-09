@@ -90,8 +90,7 @@ NUM_EPOCHS = 2
 #   * Phase 3 peak VRAM does NOT grow with GA or P: backward() runs per
 #     sample, so only one group's autograd graph is alive at a time. It does
 #     grow with G — one group is G x MAX_TURNS turn rows, packed at
-#     PACKED_MAX_ROWS and all alive until that sample's backward. With gradient
-#     checkpointing enabled, activation memory per turn row drops 60-80%.
+#     PACKED_MAX_ROWS and all alive until that sample's backward.
 PER_DEVICE_BATCH_SIZE = 16
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 5.0e-7
@@ -143,11 +142,12 @@ ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "sdpa")
 #
 # The binding constraint is NOT the logits tensor ((rows, maxlen, vocab) bf16,
 # ~700MB per row at 2.3k tokens) — it is the per-row autograd graph that
-# Phase 3's backward needs. Without gradient checkpointing: ~11GB per turn row
-# at 2.3k tokens for a 7B (28 layers x ~170KB of saved activations per token,
-# SDPA so no materialised attention matrix). With gradient checkpointing
-# enabled (line ~1000): activation memory drops 60-80%, so ~2-4GB per turn row,
-# at the cost of 20-30% slower backward (recomputes activations on demand).
+# Phase 3's backward needs, roughly ~11GB per turn row at 2.3k tokens for a
+# 7B (28 layers x ~170KB of saved activations per token, SDPA so no
+# materialised attention matrix). Measured on the MI300X: the whole run sits
+# at 182GB of 196GB with this at 4, i.e. ~14GB of headroom, so each extra row
+# costs about as much as the headroom left. Raise it only together with
+# gradient checkpointing or shorter turns.
 PACKED_MAX_ROWS = 4
 
 # Qwen2.5 chat template markers (hardcoded for deterministic tokenization)
@@ -990,16 +990,10 @@ def main():
     # enable_input_require_grads is REQUIRED for GRPO — without it,
     # per-token logprobs don't require grad and loss.backward() fails.
     # It makes embedding output require gradients, which cascades through
-    # the model. This uses significant VRAM (~30+ GB for 7B model without
-    # gradient checkpointing).
+    # the model. This uses significant VRAM (~30+ GB for 7B model), so we
+    # must keep sequences short and turns minimal.
     model.enable_input_require_grads()
-
-    # Enable gradient checkpointing to reduce activation memory by 60-80%
-    # (trades memory for 20-30% slower backward via recomputation). Modern
-    # transformers (>=4.18) support this with enable_input_require_grads.
-    model.gradient_checkpointing_enable()
-
-    # KV cache must be disabled for gradient checkpointing to work
+    # Disable gradient checkpointing — it conflicts with the hook above
     if model.config.use_cache:
         model.config.use_cache = False
     model.train()
