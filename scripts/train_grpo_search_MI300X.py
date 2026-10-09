@@ -123,6 +123,16 @@ NUM_SAMPLES = 500
 # Env-overridable for A/B runs: GRPO_INNER_UPDATES=1 uv run python ...
 NUM_INNER_UPDATES = int(os.environ.get("GRPO_INNER_UPDATES", "2"))
 
+# Per-completion backward: process one completion at a time in Phase 3 instead
+# of batching all completions of a group. Trades deduplication for memory:
+# peak drops from G×MAX_TURNS (12 turn rows, ~128GB activations) to MAX_TURNS
+# (3 turn rows, ~32GB activations) — a 75% reduction. Slightly slower because
+# it loses cross-completion turn deduplication (e.g. if 2 completions share
+# the same SEARCH turn, they now forward it twice). Set to "1" to enable when
+# Phase 3 OOMs with the default batched path.
+# Env-overridable: PER_COMPLETION_BACKWARD=1 python ...
+PER_COMPLETION_BACKWARD = os.environ.get("PER_COMPLETION_BACKWARD", "0") == "1"
+
 # Pack ALL sequences of one micro-batch (PER_DEVICE_BATCH_SIZE samples x
 # NUM_GENERATIONS completions) into a single batched generate() call.
 # On a launch-bound GPU (measured: GFX-Uti 100% but Mem-Uti 8%, ~84us/kernel)
@@ -836,59 +846,97 @@ def run_phase3_updates(model, optimizer, trainable_params, step_data,
                 group_turns = sample['turns']
                 advantages = sample['advantages']
 
-                # Batch compute all logprobs at once (reduces forward passes)
-                batch_logprobs = compute_batch_logprobs(model, group_turns)
+                if PER_COMPLETION_BACKWARD:
+                    # Per-completion backward: process one completion at a time
+                    # to keep only MAX_TURNS turn rows alive (peak ~32GB
+                    # activations instead of G×MAX_TURNS ~128GB). Loses
+                    # cross-completion turn deduplication, so slightly slower.
+                    for g in range(len(group_turns)):
+                        batch_logprobs = compute_batch_logprobs(model, [group_turns[g]])
+                        new_lps, old_lps = batch_logprobs[0]
 
-                # Sum the group's per-completion losses and backward ONCE.
-                # The packed forward shares ONE autograd graph across all
-                # completions of the group, so per-completion sequential
-                # backward() would re-traverse freed saved tensors
-                # (RuntimeError: backward through the graph a second time).
-                # Summing first is mathematically identical (gradients add)
-                # and the peak memory is the same: the shared activations
-                # are alive until the last backward either way.
-                sample_loss = None
-                for g in range(len(group_turns)):
-                    new_lps, old_lps = batch_logprobs[g]
+                        if len(new_lps) == 0 or len(old_lps) == 0:
+                            continue
 
-                    if len(new_lps) == 0 or len(old_lps) == 0:
-                        continue
+                        if credit_cfg.mode != "none":
+                            adv = build_token_advantages(
+                                group_turns[g], float(advantages[g]), credit_cfg
+                            ).to(model.device)
+                        else:
+                            adv = advantages[g]
 
-                    if credit_cfg.mode != "none":
-                        # CW-GRPO: reallocate the trajectory advantage across
-                        # turns. Token order matches the concatenated
-                        # per-turn logprobs in new_lps.
-                        adv = build_token_advantages(
-                            group_turns[g], float(advantages[g]), credit_cfg
-                        ).to(model.device)
-                    else:
-                        adv = advantages[g]
-                    loss = grpo_loss(new_lps, old_lps, adv,
-                                     beta=beta, epsilon_low=epsilon_low,
-                                     epsilon_high=epsilon_high)
-                    # Divide by the completions in the WHOLE step (all
-                    # micros) so a pass's gradient is the average over
-                    # its completions, invariant to PER_DEVICE_BATCH_SIZE
-                    # and GRADIENT_ACCUMULATION_STEPS.
-                    loss = loss / total_completions
-                    sample_loss = loss if sample_loss is None else sample_loss + loss
+                        loss = grpo_loss(new_lps, old_lps, adv,
+                                         beta=beta, epsilon_low=epsilon_low,
+                                         epsilon_high=epsilon_high)
+                        loss = loss / total_completions
 
-                    total_loss += loss.item() * total_completions
+                        # Backward immediately to free this completion's activations
+                        loss.backward()
 
-                    if u > 0:
-                        # Off-policy diagnostics: only inner passes 2..mu can
-                        # deviate from the frozen old_logprobs (pass 1 is
-                        # on-policy by construction).
-                        with torch.no_grad():
-                            ratio = torch.exp(new_lps - old_lps)
-                            ratio_devs.append((ratio - 1).abs().mean().item())
-                            clip_fracs.append(
-                                ((ratio < 1 - epsilon_low) |
-                                 (ratio > 1 + epsilon_high)
-                                 ).float().mean().item())
+                        total_loss += loss.item() * total_completions
 
-                if sample_loss is not None:
-                    sample_loss.backward()
+                        if u > 0:
+                            with torch.no_grad():
+                                ratio = torch.exp(new_lps - old_lps)
+                                ratio_devs.append((ratio - 1).abs().mean().item())
+                                clip_fracs.append(
+                                    ((ratio < 1 - epsilon_low) |
+                                     (ratio > 1 + epsilon_high)
+                                     ).float().mean().item())
+                else:
+                    # Batch compute all logprobs at once (reduces forward passes)
+                    batch_logprobs = compute_batch_logprobs(model, group_turns)
+
+                    # Sum the group's per-completion losses and backward ONCE.
+                    # The packed forward shares ONE autograd graph across all
+                    # completions of the group, so per-completion sequential
+                    # backward() would re-traverse freed saved tensors
+                    # (RuntimeError: backward through the graph a second time).
+                    # Summing first is mathematically identical (gradients add)
+                    # and the peak memory is the same: the shared activations
+                    # are alive until the last backward either way.
+                    sample_loss = None
+                    for g in range(len(group_turns)):
+                        new_lps, old_lps = batch_logprobs[g]
+
+                        if len(new_lps) == 0 or len(old_lps) == 0:
+                            continue
+
+                        if credit_cfg.mode != "none":
+                            # CW-GRPO: reallocate the trajectory advantage across
+                            # turns. Token order matches the concatenated
+                            # per-turn logprobs in new_lps.
+                            adv = build_token_advantages(
+                                group_turns[g], float(advantages[g]), credit_cfg
+                            ).to(model.device)
+                        else:
+                            adv = advantages[g]
+                        loss = grpo_loss(new_lps, old_lps, adv,
+                                         beta=beta, epsilon_low=epsilon_low,
+                                         epsilon_high=epsilon_high)
+                        # Divide by the completions in the WHOLE step (all
+                        # micros) so a pass's gradient is the average over
+                        # its completions, invariant to PER_DEVICE_BATCH_SIZE
+                        # and GRADIENT_ACCUMULATION_STEPS.
+                        loss = loss / total_completions
+                        sample_loss = loss if sample_loss is None else sample_loss + loss
+
+                        total_loss += loss.item() * total_completions
+
+                        if u > 0:
+                            # Off-policy diagnostics: only inner passes 2..mu can
+                            # deviate from the frozen old_logprobs (pass 1 is
+                            # on-policy by construction).
+                            with torch.no_grad():
+                                ratio = torch.exp(new_lps - old_lps)
+                                ratio_devs.append((ratio - 1).abs().mean().item())
+                                clip_fracs.append(
+                                    ((ratio < 1 - epsilon_low) |
+                                     (ratio > 1 + epsilon_high)
+                                     ).float().mean().item())
+
+                    if sample_loss is not None:
+                        sample_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         for pg in optimizer.param_groups:
@@ -1047,6 +1095,10 @@ def main():
     print(f"  Steps: {total_steps}, Warmup: {warmup_steps}")
     print(f"  Batch: {PER_DEVICE_BATCH_SIZE} × {GRADIENT_ACCUMULATION_STEPS}")
     print(f"  Inner updates per step (mu): {NUM_INNER_UPDATES}")
+    if PER_COMPLETION_BACKWARD:
+        print(f"  Per-completion backward: ENABLED (peak {MAX_TURNS} turn rows, -75% memory)")
+    else:
+        print(f"  Batched backward: ENABLED (peak {NUM_GENERATIONS}×{MAX_TURNS} turn rows)")
 
     # ============================================================
     # Training Loop
@@ -1067,6 +1119,7 @@ def main():
             "epsilon_low": EPSILON_LOW,
             "epsilon_high": EPSILON_HIGH,
             "num_inner_updates": NUM_INNER_UPDATES,
+            "per_completion_backward": PER_COMPLETION_BACKWARD,
             "max_turns": MAX_TURNS,
             "max_completion_tokens": MAX_COMPLETION_TOKENS,
             "num_samples": NUM_SAMPLES,
