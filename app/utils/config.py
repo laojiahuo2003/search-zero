@@ -84,7 +84,10 @@ class Config:
     # --- Tracking (SwanLab) ---
     # api_key is only needed for mode=online. Without one the run stays local.
     swanlab_api_key: Optional[str] = os.getenv("SWANLAB_API_KEY") or None
-    swanlab_project: str = _env("SWANLAB_PROJECT", "search-zero")
+    # NOTE: swanlab >=0.9 nests fields (project.name), so SWANLAB_PROJECT collides
+    # with the "project" object and fails pydantic parsing. The supported name is
+    # SWANLAB_PROJ_NAME.
+    swanlab_project: str = _env("SWANLAB_PROJ_NAME", "search-zero")
     swanlab_workspace: Optional[str] = os.getenv("SWANLAB_WORKSPACE") or None
     # None -> resolve_mode() picks online when a key exists, else local.
     swanlab_mode: Optional[str] = os.getenv("SWANLAB_MODE") or None
