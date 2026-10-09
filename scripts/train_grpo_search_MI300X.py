@@ -90,7 +90,7 @@ NUM_EPOCHS = 2
 #   * Phase 3 peak VRAM does NOT grow with GA or P: backward() runs per
 #     sample, so only one group's autograd graph is alive at a time. It does
 #     grow with G — one group is G x MAX_TURNS turn rows, packed at
-#     max_batch_rows=4 and all alive until that sample's backward.
+#     PACKED_MAX_ROWS and all alive until that sample's backward.
 PER_DEVICE_BATCH_SIZE = 16
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 5.0e-7
@@ -136,7 +136,19 @@ BATCHED_GENERATION = True
 # frequently SLOWER than PyTorch's native SDPA for single-stream decode
 # (observed ~10x). "sdpa" is the recommended default; try "flash_attention_2"
 # only if you benchmark it faster on your stack.
-ATTN_IMPLEMENTATION = "sdpa"
+ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "sdpa")
+
+# Rows per packed forward in the Phase 1 / Phase 3 logprob passes.
+#
+# The binding constraint is NOT the logits tensor ((rows, maxlen, vocab) bf16,
+# ~700MB per row at 2.3k tokens) — it is the per-row autograd graph that
+# Phase 3's backward needs, roughly ~11GB per turn row at 2.3k tokens for a
+# 7B (28 layers x ~170KB of saved activations per token, SDPA so no
+# materialised attention matrix). Measured on the MI300X: the whole run sits
+# at 182GB of 196GB with this at 4, i.e. ~14GB of headroom, so each extra row
+# costs about as much as the headroom left. Raise it only together with
+# gradient checkpointing or shorter turns.
+PACKED_MAX_ROWS = 4
 
 # Qwen2.5 chat template markers (hardcoded for deterministic tokenization)
 CHAT_MARKERS = {
@@ -611,14 +623,24 @@ def compute_turn_logprobs(model, input_ids, gen_ids):
     L_gen = len(gen_ids)
 
     gen_logits = logits[L_in - 1 : L_in + L_gen - 1]  # (L_gen, V)
-    gen_logprobs = torch.log_softmax(gen_logits.float(), dim=-1)
     gen_targets = torch.tensor(gen_ids, device=model.device).unsqueeze(1)
-    token_logprobs = gen_logprobs.gather(1, gen_targets).squeeze(1)  # (L_gen,)
+    # Only the target token's logprob is needed, so skip the full-vocab
+    # log_softmax: log_softmax(x)[i] == x[i] - logsumexp(x). This drops two
+    # full-vocab kernels per turn row and a (L_gen, vocab) float32 tensor that
+    # backward would otherwise have to keep alive for log_softmax's own
+    # gradient (~40MB at the observed L_gen=68, up to ~156MB at the 256 cap —
+    # small next to the ~11GB activation graph per row, but free). Verified
+    # numerically identical forward and backward (rel diff ~1e-6, four orders
+    # below bf16's own eps).
+    token_logprobs = (
+        gen_logits.gather(1, gen_targets).squeeze(1).float()
+        - torch.logsumexp(gen_logits.float(), dim=-1)
+    )  # (L_gen,)
 
     return token_logprobs
 
 
-def batched_compute_turn_logprobs(model, turn_specs, max_batch_rows=4):
+def batched_compute_turn_logprobs(model, turn_specs, max_batch_rows=PACKED_MAX_ROWS):
     """Compute per-token logprobs for many (input_ids, gen_ids) pairs via
     packed left-padded forward passes.
 
@@ -681,10 +703,14 @@ def _packed_turn_logprob_forward(model, batch):
         # unpadded row maxlen == L_in+L_gen, so this is exactly the
         # sequential path's logits[L_in-1 : L_in+L_gen-1].
         gen_logits = logits[r, maxlen - L_gen - 1 : maxlen - 1]  # (L_gen, V)
-        gen_logprobs = torch.log_softmax(gen_logits.float(), dim=-1)
         gen_targets = torch.tensor(batch[r][1],
                                    device=model.device).unsqueeze(1)
-        row_results.append(gen_logprobs.gather(1, gen_targets).squeeze(1))
+        # Same substitution as compute_turn_logprobs: target logit minus
+        # logsumexp instead of a full-vocab log_softmax.
+        row_results.append(
+            gen_logits.gather(1, gen_targets).squeeze(1).float()
+            - torch.logsumexp(gen_logits.float(), dim=-1)
+        )
 
     return row_results
 
@@ -721,7 +747,6 @@ def compute_batch_logprobs(model, all_turns_list):
     all_new_lps = batched_compute_turn_logprobs(
         model,
         [(turn['input_ids'], turn['gen_ids']) for turn in unique_turns],
-        max_batch_rows=4,
     )
 
     # Reconstruct per-completion logprobs
