@@ -1001,9 +1001,13 @@ def main():
     print(f"  Output: {OUTPUT_DIR}")
     print("=" * 60)
 
-    gpu_name = torch.cuda.get_device_name(0)
-    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-    print(f"\nGPU: {gpu_name} ({vram:.1f} GB)")
+    # GPU info (ROCm-compatible: torch.cuda works on both CUDA and ROCm)
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"\nGPU: {gpu_name} ({vram:.1f} GB)")
+    else:
+        print("\nGPU: Not detected (running on CPU)")
 
     # ---- 1. Tokenizer ----
     print("\n[1/6] Loading tokenizer...")
